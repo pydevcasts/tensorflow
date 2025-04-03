@@ -15,6 +15,12 @@ limitations under the License.
 
 #include "xla/hlo/transforms/simplifiers/dynamic_dimension_simplifier.h"
 
+#include <cstdint>
+#include <vector>
+
+#include "absl/container/flat_hash_set.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/status_macros.h"
@@ -60,7 +66,7 @@ absl::StatusOr<bool> SliceConcatForwarding(HloInstruction* slice) {
     return false;
   }
 
-  if (slice->shape().rank() != 1) {
+  if (slice->shape().dimensions_size() != 1) {
     // Slice concat forwarding only work for size 1 tensor.
     return false;
   }
@@ -99,15 +105,15 @@ absl::StatusOr<bool> ReshapeBroadcastForwarding(HloInstruction* reshape) {
     return false;
   }
 
-  if (reshape->shape().rank() != 0) {
+  if (reshape->shape().dimensions_size() != 0) {
     return false;
   }
 
-  if (broadcast->shape().rank() != 1) {
+  if (broadcast->shape().dimensions_size() != 1) {
     return false;
   }
 
-  if (broadcast->mutable_operand(0)->shape().rank() != 0) {
+  if (broadcast->mutable_operand(0)->shape().dimensions_size() != 0) {
     return false;
   }
 

@@ -75,7 +75,6 @@ PACKAGE_STATIC_DEPS = [
     "@icu//:__subpackages__",
     "@libjpeg_turbo//:__subpackages__",
     "@llvm-project//:__subpackages__",
-    "@nsync//:__subpackages__",
     "@png//:__subpackages__",
     "@sobol_data//:__subpackages__",
     "@stablehlo//:__subpackages__",
@@ -91,7 +90,6 @@ PACKAGE_STATIC_DEPS = [
     "@com_googlesource_code_re2//:__subpackages__",
     "@compute_library//:__subpackages__",
     "@curl//:__subpackages__",
-    "@double_conversion//:__subpackages__",
     "@eigen_archive//:__subpackages__",
     "@farmhash_archive//:__subpackages__",
     "@farmhash_gpu_archive//:__subpackages__",
@@ -108,8 +106,9 @@ PACKAGE_STATIC_DEPS = [
     "@local_config_tensorrt//:__subpackages__",
     "@local_execution_config_platform//:__subpackages__",
     "@mkl_dnn_acl_compatible//:__subpackages__",
-    "@ml_dtypes//:__subpackages__",
+    "@ml_dtypes_py//ml_dtypes:__subpackages__",
     "@nccl_archive//:__subpackages__",
+    "@net_zstd//:__subpackages__",
     "@nvtx_archive//:__subpackages__",
     "@onednn//:__subpackages__",
     "@org_sqlite//:__subpackages__",
@@ -191,6 +190,8 @@ package(
 #     name = "build_cleaner_spec_test",
 #     src = "build_cleaner_spec.textproto",
 # )
+#
+# exports_files(srcs = ["METADATA"])
 # copybara:uncomment_end
 
 licenses(["notice"])
@@ -892,6 +893,22 @@ config_setting(
     visibility = ["//visibility:public"],
 )
 
+# This flag specifies the file prefixes to strip from the file imports
+# when generating python apis.
+config_setting(
+    name = "litert_prefixes",
+    define_values = {"litert_prefixes": "external/org_tensorflow/"},
+    visibility = ["//visibility:public"],
+)
+
+# This flag disables generating tensorflow.lite.python under LiteRT repo.
+# Avoid using flag for creating tflite wheels as tensorflow/lite is not yet fully split from tf.
+config_setting(
+    name = "disable_tf_lite_py",
+    define_values = {"disable_tf_lite_py": "true"},
+    visibility = ["//visibility:public"],
+)
+
 # This flag enables experimental MLIR support.
 config_setting(
     name = "with_mlir_support",
@@ -1108,10 +1125,21 @@ filegroup(
 )
 
 bzl_library(
+    name = "tf_version_bzl",
+    srcs = [
+        "tf_version.bzl",
+        # copybara:uncomment "tf_version.google.bzl",
+    ],
+    # copybara:uncomment parse_tests = False,
+    visibility = ["//visibility:public"],
+)
+
+bzl_library(
     name = "tensorflow_bzl",
     srcs = ["tensorflow.bzl"],
     visibility = ["//visibility:public"],
     deps = [
+        ":tf_version_bzl",
         "//tensorflow/core/platform:build_config_root_bzl",
         "//tensorflow/core/platform:rules_cc_bzl",
         "//third_party/compute_library:build_defs_bzl",
@@ -1121,7 +1149,7 @@ bzl_library(
         "@local_config_cuda//cuda:build_defs_bzl",
         "@local_config_rocm//rocm:build_defs_bzl",
         "@local_config_tensorrt//:build_defs_bzl",
-        "@local_tsl//third_party/py/rules_pywrap:pywrap_bzl",
+        "@local_xla//third_party/py/rules_pywrap:pywrap_bzl",
         "@local_xla//xla/tsl:tsl_bzl",
         "@local_xla//xla/tsl/mkl:build_defs_bzl",
         "@rules_java//java:rules",
@@ -1245,6 +1273,7 @@ cc_import(
         "//tensorflow:macos": ":libtensorflow_framework.dylib",
         "//conditions:default": ":libtensorflow_framework.so.%s" % VERSION_MAJOR,
     }),
+    visibility = ["//visibility:public"],
 )
 
 # -------------------------------------------
@@ -1489,7 +1518,7 @@ tf_cc_shared_library(
 
 # To avoid duplication, check that the C++ or python library does not depend on
 # the stream executor cuda plugins. Targets that want to use cuda APIs should
-# instead depend on the dummy plugins in @local_tsl//tsl/platform/default/build_config
+# instead depend on the dummy plugins in //tensorflow/compiler/xla/tsl/platform/default/build_config
 # and use header only targets.
 # TODO(ddunleavy): This seems completely broken. :tensorflow_cc depends on
 # cuda_platform from tf_additional_binary_deps and this doesn't break.
@@ -1499,7 +1528,6 @@ check_deps(
         [],
         otherwise = [
             "@local_xla//xla/stream_executor/cuda:all_runtime",
-            "@local_xla//xla/stream_executor/cuda:cuda_driver",
             "@local_xla//xla/stream_executor/cuda:cuda_platform",
             "@local_xla//xla/stream_executor/cuda:cudnn_plugin",
             "@local_xla//xla/stream_executor/cuda:cufft_plugin",
@@ -1677,6 +1705,10 @@ generate_apis(
         "compat_template_v1.__init__.py",
         "compat_template.__init__.py",
     ],
+    file_prefixes_to_strip = select({
+        ":litert_prefixes": ["external/org_tensorflow/"],
+        "//conditions:default": [],
+    }),
     output_dir = "_api/v1/",
     output_files = TENSORFLOW_API_INIT_FILES_V1,
     output_package = "tensorflow._api.v1",
@@ -1697,10 +1729,20 @@ generate_apis(
         "compat_template_v1.__init__.py",
         "compat_template.__init__.py",
     ],
+    file_prefixes_to_strip = select({
+        ":litert_prefixes": ["external/org_tensorflow/"],
+        "//conditions:default": [],
+    }),
     output_dir = "_api/v2/",
     output_files = TENSORFLOW_API_INIT_FILES_V2,
     output_package = "tensorflow._api.v2",
-    packages_to_ignore = ["tensorflow.python.framework.test_ops"],
+    packages_to_ignore = select({
+        ":disable_tf_lite_py": [
+            "tensorflow.python.framework.test_ops",
+            "tensorflow.lite",
+        ],
+        "//conditions:default": ["tensorflow.python.framework.test_ops"],
+    }),
     root_file_name = "v2.py",
     root_init_template = "api_template.__init__.py",
     visibility = ["//visibility:public"],

@@ -28,6 +28,8 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/status_macros.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tensorflow/core/common_runtime/optimization_registry.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/function.pb.h"
@@ -37,14 +39,11 @@ limitations under the License.
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/graph/graph.h"
 #include "tensorflow/core/graph/tensor_id.h"
-#include "tensorflow/core/platform/status.h"
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/protobuf/tpu/tpu_embedding_configuration.pb.h"
 #include "tensorflow/core/tpu/graph_rewrite/tpu_embedding_rewrite_pass_utils.h"
 #include "tensorflow/core/tpu/tpu_embedding_configuration_utils.h"
 #include "tensorflow/core/util/device_name_utils.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
 
 namespace tensorflow {
 namespace {
@@ -181,7 +180,8 @@ absl::StatusOr<NodeDef> MakeSendGradientsNodeDef(
     absl::Span<const NodeDefBuilder::NodeOut> data_inputs,
     absl::Span<const std::string> control_inputs) {
   tpu::TPUEmbeddingConfiguration tpu_embedding_config;
-  if (!tpu_embedding_config.ParseFromString(tpu_embedding_config_str)) {
+  if (!tpu_embedding_config.ParseFromString(
+          std::string(tpu_embedding_config_str))) {
     return absl::InvalidArgumentError(
         "Malformed config attribute in the SendTPUEmbeddingGradients node.");
   }

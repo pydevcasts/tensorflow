@@ -159,8 +159,7 @@ absl::Status GrpcServer::GetHostAndPort(const ServerDef& server_def,
               server_def.DebugString());
         }
         auto colon_index = iter->second.find_last_of(':');
-        if (!strings::safe_strto32(iter->second.substr(colon_index + 1),
-                                   port)) {
+        if (!absl::SimpleAtoi(iter->second.substr(colon_index + 1), port)) {
           return errors::InvalidArgument(
               "Could not parse port for local server from \"", iter->second,
               "\".");
@@ -284,7 +283,7 @@ absl::Status GrpcServer::Init(const GrpcServerOptions& opts) {
   coordination_service_ =
       new GrpcCoordinationServiceImpl(compute_pool, &builder);
 
-  profiler_service_ = profiler::CreateProfilerService();
+  profiler_service_ = tsl::profiler::CreateProfilerService();
   builder.RegisterService(profiler_service_.get());
 
   // Add any extra services to be started.
@@ -419,8 +418,7 @@ absl::Status GrpcServer::WorkerCacheFactory(
   int requested_port;
 
   auto colon_index = host_port.find_last_of(':');
-  if (!strings::safe_strto32(host_port.substr(colon_index + 1),
-                             &requested_port)) {
+  if (!absl::SimpleAtoi(host_port.substr(colon_index + 1), &requested_port)) {
     return errors::Internal("Could not parse port for local server from \"",
                             host_port, "\".");
   }

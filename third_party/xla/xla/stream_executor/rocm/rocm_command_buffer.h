@@ -26,15 +26,17 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "rocm/include/hip/hip_runtime.h"
+#include "xla/stream_executor/bit_pattern.h"
 #include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/gpu/gpu_command_buffer.h"
-#include "xla/stream_executor/gpu/gpu_executor.h"
 #include "xla/stream_executor/gpu/scoped_gpu_graph_exec.h"
 #include "xla/stream_executor/gpu/scoped_update_mode.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/stream_executor.h"
 
 namespace stream_executor::gpu {
 
@@ -43,46 +45,51 @@ class RocmCommandBuffer : public GpuCommandBuffer {
  public:
   // Creates a new ROCm command buffer and the underlying HIP graph.
   static absl::StatusOr<std::unique_ptr<RocmCommandBuffer>> Create(
-      Mode mode, GpuExecutor* parent);
+      Mode mode, StreamExecutor* parent);
 
   ~RocmCommandBuffer() override;
 
  private:
-  RocmCommandBuffer(Mode mode, GpuExecutor* parent, hipGraph_t graph,
+  RocmCommandBuffer(Mode mode, StreamExecutor* parent, hipGraph_t graph,
                     bool is_owned_graph)
       : GpuCommandBuffer(mode, parent),
-        parent_(parent),
         graph_(graph),
         is_owned_graph_(is_owned_graph) {}
 
-  absl::Status LaunchSetIfConditionKernel(
-      ExecutionScopeId execution_scope_id,
-      GraphConditionalHandle if_conditional,
-      DeviceMemory<bool> predicate) override;
-  absl::Status LaunchSetIfElseConditionKernel(
-      ExecutionScopeId execution_scope_id,
-      GraphConditionalHandle if_conditional,
-      GraphConditionalHandle else_conditional,
-      DeviceMemory<bool> predicate) override;
-  absl::Status LaunchSetCaseConditionKernel(
-      ExecutionScopeId execution_scope_id, GraphConditionalHandles conditionals,
-      DeviceMemory<int32_t> index, int32_t batch_offset,
+  //===--------------------------------------------------------------------===//
+  // APIs for launching kernels to update conditional handles.
+  //===--------------------------------------------------------------------===//
+
+  absl::StatusOr<GraphNodeHandle> CreateSetCaseConditionNode(
+      absl::Span<const GraphConditionalHandle> conditionals,
+      DeviceMemory<uint8_t> index, bool index_is_bool, int32_t batch_offset,
+      bool enable_conditional_default,
+      absl::Span<const GraphNodeHandle> dependencies) override;
+
+  absl::Status UpdateSetCaseConditionNode(
+      GraphNodeHandle handle,
+      absl::Span<const GraphConditionalHandle> conditionals,
+      DeviceMemory<uint8_t> index, bool index_is_bool, int32_t batch_offset,
       bool enable_conditional_default) override;
-  absl::Status LaunchSetForConditionKernel(ExecutionScopeId execution_scope_id,
-                                           GraphConditionalHandle conditional,
-                                           DeviceMemory<int32_t> loop_counter,
-                                           int32_t iterations) override;
-  absl::Status LaunchSetWhileConditionKernel(
-      ExecutionScopeId execution_scope_id, GraphConditionalHandle conditional,
+
+  absl::StatusOr<GraphNodeHandle> CreateSetWhileConditionNode(
+      GraphConditionalHandle conditional, DeviceMemory<bool> predicate,
+      absl::Span<const GraphNodeHandle> dependencies) override;
+
+  absl::Status UpdateSetWhileConditionNode(
+      GraphNodeHandle handle, GraphConditionalHandle conditional,
       DeviceMemory<bool> predicate) override;
 
-  absl::StatusOr<ConditionalNodeResult> CreateConditionalNode(
-      const Dependencies& dependencies, GraphConditionalHandle conditional,
-      ConditionType type) override;
+  //===--------------------------------------------------------------------===//
+
+  absl::StatusOr<GraphConditionalNodeHandle> CreateConditionalNode(
+      absl::Span<const GraphNodeHandle> dependencies,
+      GraphConditionalHandle conditional, ConditionType type) override;
 
   absl::StatusOr<GraphNodeHandle> CreateMemsetNode(
-      const Dependencies& dependencies, DeviceMemoryBase destination,
-      BitPattern bit_pattern, size_t num_elements) override;
+      absl::Span<const GraphNodeHandle> dependencies,
+      DeviceMemoryBase destination, BitPattern bit_pattern,
+      size_t num_elements) override;
 
   absl::Status UpdateMemsetNode(GraphNodeHandle node_handle,
                                 DeviceMemoryBase destination,
@@ -90,8 +97,9 @@ class RocmCommandBuffer : public GpuCommandBuffer {
                                 size_t num_elements) override;
 
   absl::StatusOr<GraphNodeHandle> CreateMemcpyD2DNode(
-      const Dependencies& dependencies, DeviceMemoryBase destination,
-      DeviceMemoryBase source, uint64_t size) override;
+      absl::Span<const GraphNodeHandle> dependencies,
+      DeviceMemoryBase destination, DeviceMemoryBase source,
+      uint64_t size) override;
 
   absl::Status UpdateMemcpyD2DNode(GraphNodeHandle node_handle,
                                    DeviceMemoryBase destination,
@@ -99,13 +107,14 @@ class RocmCommandBuffer : public GpuCommandBuffer {
                                    uint64_t size) override;
 
   absl::StatusOr<GraphNodeHandle> CreateChildNode(
-      const Dependencies& dependencies, const CommandBuffer& nested) override;
+      absl::Span<const GraphNodeHandle> dependencies,
+      const CommandBuffer& nested) override;
 
   absl::Status UpdateChildNode(GraphNodeHandle node_handle,
                                const CommandBuffer& nested) override;
 
   absl::StatusOr<GraphNodeHandle> CreateKernelNode(
-      const Dependencies& dependencies, const ThreadDim& threads,
+      absl::Span<const GraphNodeHandle> dependencies, const ThreadDim& threads,
       const BlockDim& blocks, const Kernel& kernel,
       const KernelArgsPackedArrayBase& args) override;
 
@@ -115,13 +124,12 @@ class RocmCommandBuffer : public GpuCommandBuffer {
                                 const KernelArgsPackedArrayBase& args) override;
 
   absl::StatusOr<GraphNodeHandle> CreateBarrierNode(
-      const Dependencies& dependencies) override;
+      absl::Span<const GraphNodeHandle> dependencies) override;
 
   absl::Status Trace(Stream* stream,
                      absl::AnyInvocable<absl::Status()> function) override;
 
   absl::Status SetNodeExecutionEnabled(GraphNodeHandle node_handle,
-                                       CommandBuffer& root_command_buffer,
                                        bool enabled) override;
 
   absl::Status LaunchGraph(Stream* stream) override;
@@ -144,8 +152,6 @@ class RocmCommandBuffer : public GpuCommandBuffer {
 
   absl::StatusOr<std::vector<GraphNodeHandle>> GetNodeDependencies(
       GraphNodeHandle node) override;
-
-  GpuExecutor* parent_;
 
   static_assert(std::is_pointer_v<hipGraph_t>, "hipGraph_t must be a pointer");
   static_assert(std::is_pointer_v<hipGraphExec_t>,

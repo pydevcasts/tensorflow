@@ -12,18 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <any>
 #include <cstddef>
 #include <cstring>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/log/absl_log.h"
 #include "absl/log/log.h"
+#include "absl/types/span.h"
 #include "tensorflow/lite/experimental/litert/c/litert_common.h"
 #include "tensorflow/lite/experimental/litert/c/litert_tensor_buffer.h"
 #include "tensorflow/lite/experimental/litert/c/litert_tensor_buffer_requirements.h"
+#include "tensorflow/lite/experimental/litert/cc/litert_any.h"
+#include "tensorflow/lite/experimental/litert/core/filesystem.h"
 #include "tensorflow/lite/experimental/litert/test/common.h"
 #include "tensorflow/lite/experimental/litert/test/testdata/simple_model_test_vectors.h"
 #include "tensorflow/lite/experimental/litert/vendors/c/litert_dispatch.h"
+
+using ::testing::Pointwise;
 
 TEST(DispatchApi, GoogleTensor) {
 #if !defined(__ANDROID__)
@@ -31,8 +38,13 @@ TEST(DispatchApi, GoogleTensor) {
       << "This test is specific to Android devices with a GoogleTensor eTPU";
 #endif
 
-  EXPECT_EQ(LiteRtDispatchInitialize(/*options=*/nullptr, /*num_options=*/0),
-            kLiteRtStatusOk);
+  LiteRtDispatchOption dispatch_option = {
+      /*.name=*/kDispatchOptionSharedLibraryDir,
+      /*.value=*/*litert::ToLiteRtAny(std::any("/data/local/tmp")),
+  };
+  ASSERT_EQ(
+      LiteRtDispatchInitialize(/*options=*/&dispatch_option, /*num_options=*/1),
+      kLiteRtStatusOk);
 
   const char* vendor_id;
   EXPECT_EQ(LiteRtDispatchGetVendorId(&vendor_id), kLiteRtStatusOk);
@@ -56,20 +68,25 @@ TEST(DispatchApi, GoogleTensor) {
             kLiteRtStatusOk);
   ABSL_LOG(INFO) << "device_context: " << device_context;
 
-  auto model_file_name = kGoogleTensorModelFileName;
-  auto model = litert::testing::LoadBinaryFile(model_file_name);
-  EXPECT_TRUE(model.ok());
-  ABSL_LOG(INFO) << "Loaded model " << model_file_name << ", " << model->size()
+  auto model_file_name =
+      litert::testing::GetTestFilePath(kGoogleTensorModelFileName);
+  auto model = litert::internal::LoadBinaryFile(model_file_name);
+  EXPECT_TRUE(model) << model.Error();
+  ABSL_LOG(INFO) << "Loaded model " << model_file_name << ", " << model->Size()
                  << " bytes";
 
   // ///////////////////////////////////////////////////////////////////////////
   // Set up an invocation context for a given model.
   // ///////////////////////////////////////////////////////////////////////////
 
+  LiteRtMemBuffer exec_bytecode_buffer = {/*.fd=*/-1,
+                                          /*.base_addr=*/model->Data(),
+                                          /*.offset=*/0,
+                                          /*.size=*/model->Size()};
   LiteRtDispatchInvocationContext invocation_context = nullptr;
   EXPECT_EQ(LiteRtDispatchInvocationContextCreate(
                 device_context, kLiteRtDispatchExecutableTypeMlModel,
-                model->data(), model->size(), /*function_name=*/nullptr,
+                &exec_bytecode_buffer, /*function_name=*/nullptr,
                 /*num_inputs=*/2, /*num_outputs=*/1, &invocation_context),
             kLiteRtStatusOk);
   ABSL_LOG(INFO) << "Invocation context: " << invocation_context;
@@ -207,14 +224,12 @@ TEST(DispatchApi, GoogleTensor) {
     ABSL_LOG(INFO) << "Filling inputs with data";
     void* host_mem_addr;
 
-    ASSERT_EQ(LiteRtLockTensorBuffer(input_0_tensor_buffer, &host_mem_addr,
-                                     /*event=*/nullptr),
+    ASSERT_EQ(LiteRtLockTensorBuffer(input_0_tensor_buffer, &host_mem_addr),
               kLiteRtStatusOk);
     std::memcpy(host_mem_addr, kTestInput0Tensor, sizeof(kTestInput0Tensor));
     ASSERT_EQ(LiteRtUnlockTensorBuffer(input_0_tensor_buffer), kLiteRtStatusOk);
 
-    ASSERT_EQ(LiteRtLockTensorBuffer(input_1_tensor_buffer, &host_mem_addr,
-                                     /*event=*/nullptr),
+    ASSERT_EQ(LiteRtLockTensorBuffer(input_1_tensor_buffer, &host_mem_addr),
               kLiteRtStatusOk);
     std::memcpy(host_mem_addr, kTestInput1Tensor, sizeof(kTestInput1Tensor));
     ASSERT_EQ(LiteRtUnlockTensorBuffer(input_1_tensor_buffer), kLiteRtStatusOk);
@@ -234,15 +249,14 @@ TEST(DispatchApi, GoogleTensor) {
   {
     ABSL_LOG(INFO) << "Checking output...";
     void* host_mem_addr;
-    ASSERT_EQ(LiteRtLockTensorBuffer(output_tensor_buffer, &host_mem_addr,
-                                     /*event=*/nullptr),
+    ASSERT_EQ(LiteRtLockTensorBuffer(output_tensor_buffer, &host_mem_addr),
               kLiteRtStatusOk);
-    auto* output = static_cast<float*>(host_mem_addr);
-    constexpr auto output_size =
-        sizeof(kTestOutputTensor) / sizeof(kTestOutputTensor[0]);
-    for (auto i = 0; i < output_size; ++i) {
-      EXPECT_NEAR(output[i], kTestOutputTensor[i], 1e-3);
+    auto output = absl::MakeSpan(static_cast<const float*>(host_mem_addr),
+                                 kTestOutputSize);
+    for (auto i = 0; i < kTestOutputSize; ++i) {
+      ABSL_LOG(INFO) << output[i] << "\t" << kTestOutputTensor[i];
     }
+    EXPECT_THAT(output, Pointwise(testing::FloatNear(1e-3), kTestOutputTensor));
     ASSERT_EQ(LiteRtUnlockTensorBuffer(output_tensor_buffer), kLiteRtStatusOk);
   }
 

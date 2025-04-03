@@ -42,14 +42,14 @@ bool ComputeInNhwcEnabled(DataType data_type, se::Stream* stream,
   // configurations it's more efficient to run computation in NCHW data format.
   bool use_nhwc_tf32 = data_type == DT_FLOAT &&
                        stream->GetCudaComputeCapability().IsAtLeast(
-                           se::CudaComputeCapability::AMPERE) &&
+                           se::CudaComputeCapability::kAmpere) &&
                        tensorflow::tensor_float_32_execution_enabled();
   bool use_nhwc_fp16 =
       data_type == DT_HALF && stream->GetCudaComputeCapability().IsAtLeast(
-                                  se::CudaComputeCapability::VOLTA);
+                                  se::CudaComputeCapability::kVolta);
   bool use_nhwc_bf16 =
       data_type == DT_BFLOAT16 && stream->GetCudaComputeCapability().IsAtLeast(
-                                      se::CudaComputeCapability::AMPERE);
+                                      se::CudaComputeCapability::kAmpere);
   if (use_4d_tensor) {
     return use_nhwc_fp16 || use_nhwc_tf32 || use_nhwc_bf16;
   }
@@ -89,8 +89,7 @@ StatusOr<AutotuneEntry<se::dnn::FusedConvOp>> AutotuneFusedConv(
 
     se::TfAllocatorAdapter tf_allocator_adapter(ctx->device()->GetAllocator({}),
                                                 stream);
-    se::RedzoneAllocator rz_allocator(stream, &tf_allocator_adapter,
-                                      se::GpuAsmOpts());
+    se::RedzoneAllocator rz_allocator(stream, &tf_allocator_adapter);
     se::DeviceMemory<T> output_ptr_rz(
         WrapRedzoneBestEffort(&rz_allocator, output_ptr));
 
@@ -256,8 +255,7 @@ StatusOr<AutotuneEntry<se::dnn::ConvOp>> AutotuneUnfusedConv(
 #if GOOGLE_CUDA
     se::TfAllocatorAdapter tf_allocator_adapter(ctx->device()->GetAllocator({}),
                                                 stream);
-    se::RedzoneAllocator rz_allocator(stream, &tf_allocator_adapter,
-                                      se::GpuAsmOpts());
+    se::RedzoneAllocator rz_allocator(stream, &tf_allocator_adapter);
 
     // TODO(awpr): second-guess whether it's okay that this profiles
     // convolutions on uninitialized memory.

@@ -30,27 +30,28 @@ limitations under the License.
 #include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/ir/hlo_print_options.h"
+#include "xla/tsl/platform/statusor.h"
 #ifdef PLATFORM_GOOGLE
-#include "third_party/json/src/json.hpp"
-#include "tensorflow/compiler/mlir/lite/experimental/google/tooling/google/direct_hlo_to_json_graph_convert.h"
+#include "nlohmann/json.hpp"
+#include "tensorflow/compiler/mlir/lite/experimental/google/tooling/hlo_adapter/direct_hlo_to_json_graph_convert.h"
 #endif  // PLATFORM_GOOGLE
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_graph_dumper.h"
-#include "tensorflow/core/platform/errors.h"
-#include "tensorflow/core/platform/statusor.h"
+#include "xla/tsl/platform/errors.h"
 #include "tensorflow/core/profiler/convert/tool_options.h"
 #include "tensorflow/core/profiler/utils/hlo_module_utils.h"
-#include "tensorflow/core/profiler/utils/hlo_proto_to_module.h"
+#include "xprof/utils/hlo_proto_to_module.h"  // from @org_xprof
 
 namespace tensorflow {
 namespace profiler {
 namespace {
 
-using ::tensorflow::StatusOr;
-using ::tensorflow::errors::InvalidArgument;
+using ::tsl::StatusOr;
+using ::tsl::errors::InvalidArgument;
 using ::xla::HloComputation;
 using ::xla::HloInstruction;
 using ::xla::HloModule;
@@ -74,17 +75,6 @@ void CleanUpHloModuleForGraphviz(HloModule* hlo_module) {
   }
 }
 
-// In ModelExplorer's logic, id of a layer is a nested namespace:
-// <section_layer_name>/<computation_layer_name>/<instruction_layer_name>
-// 1. for fusion instruction:
-// <parent_computation_name>/<instruction_name>___group___.
-// 2. for computation: <computation_name>___group___.
-// Since the `section` layer in ME concept is formed on client, we are not able
-// to encode that into the nested namespace here if the section will exist.
-std::string GetLayerId(absl::string_view namespace_name) {
-  return absl::StrCat(namespace_name, "___group___");
-}
-
 #ifdef PLATFORM_GOOGLE
 // Add a custom group node on the graph level, for the center node chosen by the
 // user set its attributes like `id`, `name` or `opcode` in `graph_json`.
@@ -106,10 +96,11 @@ void AddGraphMetadata(std::string& graph_json_str,
                       const HloInstruction& instr) {
 #ifdef PLATFORM_GOOGLE
   nlohmann::json graph_json = nlohmann::json::parse(graph_json_str);
-  auto id =
-      instr.opcode() == xla::HloOpcode::kFusion
-          ? GetLayerId(absl::StrCat(instr.parent()->name(), "/", instr.name()))
-          : absl::StrCat(instr.unique_id());
+  // 1. Fusion instruction is represented as a layer on client, use its
+  // pinned node as the center node, id of the pinned node is the fusion name.
+  // 2. Other instructions are represented as nodes on client, use iteself as
+  // the center node, where node id is the instruction name.
+  std::string id = absl::StrCat(instr.name());
   AddCenterNodeMetadata(graph_json, id, instr.name(),
                         HloOpcodeString(instr.opcode()));
   graph_json_str = graph_json.dump();
@@ -119,7 +110,9 @@ void AddGraphMetadata(std::string& graph_json_str,
 void AddGraphMetadata(std::string& graph_json_str, const HloComputation& comp) {
 #ifdef PLATFORM_GOOGLE
   nlohmann::json graph_json = nlohmann::json::parse(graph_json_str);
-  AddCenterNodeMetadata(graph_json, GetLayerId(comp.name()), comp.name(), "");
+  // Computation is represented as a layer on client, use its pinned node as the
+  // center node,id of the pinned node is the computation name.
+  AddCenterNodeMetadata(graph_json, absl::StrCat(comp.name()), comp.name(), "");
   graph_json_str = graph_json.dump();
 #endif  // PLATFORM_GOOGLE
 }
@@ -309,7 +302,7 @@ absl::StatusOr<GraphViewerParams> ParseGraphViewerParams(
   GraphViewerParams params;
   std::optional<std::string> type = GetParam<std::string>(options, "type");
   if (!type.has_value()) {
-    return errors::InvalidArgument("Graph viewer must provide a type option.");
+    return InvalidArgument("Graph viewer must provide a type option.");
   }
 
   // For graph type.
@@ -342,8 +335,7 @@ absl::StatusOr<GraphViewerParams> ParseGraphViewerParams(
   }
 
   // Unknown type.
-  return errors::InvalidArgument("Unknown graph viewer type option: ",
-                                 type.value());
+  return InvalidArgument("Unknown graph viewer type option: ", type.value());
 }
 
 xla::RenderedGraphFormat GetRenderFormat(const std::string& format_string) {

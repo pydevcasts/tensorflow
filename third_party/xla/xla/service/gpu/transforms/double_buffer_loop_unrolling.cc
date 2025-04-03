@@ -118,9 +118,9 @@ absl::Status SetSendRecvValidationForPeeledInstr(HloInstruction* new_instr,
   TF_RET_CHECK(
       new_instr->opcode() == old_instr->opcode() &&
       "cloned instruction and original instruction have different opcodes");
-  if (!HloPredicateIsOp<HloOpcode::kCollectivePermute,
-                        HloOpcode::kCollectivePermuteStart, HloOpcode::kSend,
-                        HloOpcode::kRecv>(old_instr)) {
+  if (HloPredicateIsNotOp<HloOpcode::kCollectivePermute,
+                          HloOpcode::kCollectivePermuteStart, HloOpcode::kSend,
+                          HloOpcode::kRecv>(old_instr)) {
     return absl::OkStatus();
   }
 
@@ -188,9 +188,9 @@ absl::Status SetSendRecvValidation(HloInstruction* cp1, HloInstruction* cp2,
   TF_RET_CHECK(
       cp2->opcode() == cp1->opcode() &&
       "cloned instruction and original instruction have different opcodes");
-  if (!HloPredicateIsOp<HloOpcode::kCollectivePermute,
-                        HloOpcode::kCollectivePermuteStart, HloOpcode::kSend,
-                        HloOpcode::kRecv>(cp1)) {
+  if (HloPredicateIsNotOp<HloOpcode::kCollectivePermute,
+                          HloOpcode::kCollectivePermuteStart, HloOpcode::kSend,
+                          HloOpcode::kRecv>(cp1)) {
     return absl::OkStatus();
   }
   const auto& attribute_map = cp2->frontend_attributes().map();
@@ -430,8 +430,8 @@ absl::Status PeelInstructionsForOddTripCount(HloModule* module,
       HloInstruction* new_instr = old_to_new_map[old_instr];
       VLOG(2) << "Processing control predecessors for peeled instruction "
               << new_instr->ToString();
-      std::vector<HloInstruction*> new_control_pred(
-          old_instr->control_predecessors().size());
+      std::vector<HloInstruction*> new_control_pred;
+      new_control_pred.reserve(old_instr->control_predecessors().size());
       for (HloInstruction* pred : old_instr->control_predecessors()) {
         new_control_pred.push_back(old_to_new_map[pred]);
       }

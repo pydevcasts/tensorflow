@@ -18,12 +18,10 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "absl/functional/bind_front.h"
 #include "absl/status/status.h"
 #include "absl/strings/cord.h"
 #include "llvm/Support/Casting.h"
 #include "xla/python/ifrt/array_spec.h"
-#include "xla/python/ifrt/client.h"
 #include "xla/python/ifrt/custom_call_program.h"
 #include "xla/python/ifrt/device_list.h"
 #include "xla/python/ifrt/device_test_util.h"
@@ -36,9 +34,9 @@ limitations under the License.
 #include "xla/python/ifrt/sharding.h"
 #include "xla/tsl/concurrency/ref_count.h"
 #include "xla/tsl/lib/core/status_test_util.h"
-#include "tsl/platform/status_matchers.h"
-#include "tsl/platform/statusor.h"
-#include "tsl/platform/test.h"
+#include "xla/tsl/platform/status_matchers.h"
+#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/platform/test.h"
 
 namespace xla {
 namespace ifrt {
@@ -53,7 +51,7 @@ class CustomCallProgramSerDesTest : public test_util::DeviceTest {};
 TEST_P(CustomCallProgramSerDesTest, RoundTrip) {
   Shape shape0({10, 20});
   Shape shard_shape0({5, 20});
-  tsl::RCReference<DeviceList> devices = GetDevices({0, 1});
+  DeviceListRef devices = GetDevices({0, 1});
   std::shared_ptr<const Sharding> sharding0 =
       ConcreteEvenSharding::Create(devices, MemoryKind(),
                                    /*shape=*/shape0,
@@ -82,12 +80,12 @@ TEST_P(CustomCallProgramSerDesTest, RoundTrip) {
                     /*sharding=*/sharding1},
       });
 
-  TF_ASSERT_OK_AND_ASSIGN(Serialized serialized, Serialize(orig));
+  TF_ASSERT_OK_AND_ASSIGN(Serialized serialized,
+                          Serialize(orig, /*options=*/nullptr));
   TF_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<CustomCallProgram> deserialized_program,
       Deserialize<CustomCallProgram>(
-          serialized, std::make_unique<DeserializeProgramOptions>(
-                          absl::bind_front(&Client::LookupDevice, client()))));
+          serialized, std::make_unique<DeserializeProgramOptions>(client())));
 
   EXPECT_EQ(deserialized_program->type, "test type");
   EXPECT_EQ(deserialized_program->name, "test name");
@@ -126,7 +124,8 @@ INSTANTIATE_TEST_SUITE_P(NumDevices, CustomCallProgramSerDesTest,
 
 TEST(CustomCallCompileOptionsSerDesTest, RoundTrip) {
   CustomCallCompileOptions orig;
-  TF_ASSERT_OK_AND_ASSIGN(Serialized serialized, Serialize(orig));
+  TF_ASSERT_OK_AND_ASSIGN(Serialized serialized,
+                          Serialize(orig, /*options=*/nullptr));
   TF_EXPECT_OK(
       Deserialize<CustomCallCompileOptions>(serialized, /*options=*/nullptr)
           .status());
@@ -134,7 +133,8 @@ TEST(CustomCallCompileOptionsSerDesTest, RoundTrip) {
 
 TEST(CustomCallCompileOptionsSerDesTest, InvalidSerialized) {
   CustomCallCompileOptions orig;
-  TF_ASSERT_OK_AND_ASSIGN(Serialized serialized, Serialize(orig));
+  TF_ASSERT_OK_AND_ASSIGN(Serialized serialized,
+                          Serialize(orig, /*options=*/nullptr));
   serialized.set_data("abc");
   EXPECT_THAT(
       Deserialize<CustomCallCompileOptions>(serialized, /*options=*/nullptr),

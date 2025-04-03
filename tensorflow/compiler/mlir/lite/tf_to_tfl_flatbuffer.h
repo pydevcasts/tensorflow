@@ -76,14 +76,13 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> ImportSavedModel(
 // * `session` pointer may provided, it will be used to freeze resource
 // variables. If the `saved_model_dir` directory path is provided, then the
 // `tf_saved_model.asset` ops will be freezed.
-Status ConvertTFExecutorToTFLOrFlatbuffer(
+absl::Status ConvertTFExecutorToTFLOrFlatbuffer(
     std::unique_ptr<mlir::MLIRContext>&& context,
     mlir::OwningOpRef<mlir::ModuleOp> module,
     tflite::ConverterFlags& converter_flags,
     const mlir::TFL::PassConfig& pass_config,
     const std::unordered_set<std::string>& saved_model_tags,
-    llvm::StringRef saved_model_dir, std::string* result,
-    bool serialize_stablehlo_ops, bool export_to_mlir,
+    llvm::StringRef saved_model_dir, std::string* result, bool export_to_mlir,
     const quantization::PyFunctionLibrary* quantization_py_function_lib =
         nullptr);
 }  // namespace tensorflow

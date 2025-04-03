@@ -50,10 +50,11 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/literal.h"
 #include "xla/primitive_util.h"
 #include "xla/service/buffer_assignment.h"
-#include "xla/service/gpu/hlo_traversal.h"
+#include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/target_util.h"
 #include "xla/service/llvm_ir/llvm_type_conversion_util.h"
 #include "xla/service/llvm_ir/llvm_util.h"
@@ -74,12 +75,12 @@ namespace {
 
 // Return whether the given shape is rank 2 excluding the batch dimensions.
 bool IsRank2(const Shape& shape, int64_t batch_dimensions_size) {
-  return shape.rank() == batch_dimensions_size + 2;
+  return shape.dimensions_size() == batch_dimensions_size + 2;
 }
 
 // Return whether the given shape is rank 1 excluding the batch dimensions.
 bool IsRank1(const Shape& shape, int64_t batch_dimensions_size) {
-  return shape.rank() == batch_dimensions_size + 1;
+  return shape.dimensions_size() == batch_dimensions_size + 1;
 }
 
 }  // namespace
@@ -207,152 +208,7 @@ bool IsContiguousSlice(const HloInstruction& instr) {
   return false;
 }
 
-// Helper function to emit call to AMDGPU shfl_down function.
-llvm::Value* EmitAMDGPUShflDown(llvm::Value* value, llvm::Value* offset,
-                                llvm::IRBuilder<>* b) {
-  llvm::Module* module = b->GetInsertBlock()->getModule();
-  CHECK_EQ(value->getType()->getPrimitiveSizeInBits(), 32);
-  auto* i32_ty = b->getInt32Ty();
-  llvm::FunctionCallee shfl_fn = module->getOrInsertFunction(
-      llvm_ir::AsStringRef("__ockl_readuplane_i32"),
-      llvm::FunctionType::get(/*Result=*/i32_ty, {i32_ty, i32_ty},
-                              /*isVarArg=*/false));
-  // AMDGPU device function requires first argument as i32.
-  llvm::Value* result =
-      b->CreateCall(shfl_fn, {b->CreateBitCast(value, i32_ty), offset});
-  // AMDGPU device function always returns an i32 type.
-  return b->CreateBitCast(result, value->getType());
-}
-
-llvm::Value* EmitAMDGPUShflDownSwizzle(llvm::Value* value, llvm::Value* offset,
-                                       llvm::IRBuilder<>* b) {
-  llvm::Module* module = b->GetInsertBlock()->getModule();
-  CHECK_EQ(value->getType()->getPrimitiveSizeInBits(), 32);
-  auto* i32_ty = b->getInt32Ty();
-
-  llvm::Function* intrinsic = llvm::cast<llvm::Function>(
-      module
-          ->getOrInsertFunction(
-              "llvm.amdgcn.ds.swizzle",
-              llvm::FunctionType::get(/*Result=*/i32_ty, {i32_ty, i32_ty},
-                                      /*isVarArg=*/false))
-          .getCallee());
-
-  // Ensure that the first argument to the AMDGPU intrinsic is i32.
-  llvm::Value* bitcast_value = b->CreateBitCast(value, i32_ty);
-
-  // Calculate the control value for the swizzle operation.
-  llvm::Value* control_value =
-      b->CreateAdd(b->CreateMul(offset, b->getInt32(0x20)), b->getInt32(0x1f));
-
-  // Create the call to the intrinsic function.
-  llvm::Value* result =
-      b->CreateCall(intrinsic, {bitcast_value, control_value});
-
-  // Bitcast the result back to the original type of the input value.
-  return b->CreateBitCast(result, value->getType());
-}
-
-// Helper function to emit call to NVPTX shfl_down intrinsic.
-llvm::Value* EmitNVPTXShflDown(llvm::Value* value, llvm::Value* offset,
-                               llvm::IRBuilder<>* b) {
-  llvm::Module* module = b->GetInsertBlock()->getModule();
-  llvm::Intrinsic::ID llvm_intrinsic_id;
-  CHECK_EQ(value->getType()->getPrimitiveSizeInBits(), 32);
-  if (value->getType()->isFloatTy()) {
-    llvm_intrinsic_id = llvm::Intrinsic::nvvm_shfl_sync_down_f32;
-  } else {
-    llvm_intrinsic_id = llvm::Intrinsic::nvvm_shfl_sync_down_i32;
-  }
-  llvm::Function* intrinsic =
-      llvm::Intrinsic::getOrInsertDeclaration(module, llvm_intrinsic_id, {});
-  return b->CreateCall(
-      intrinsic, {b->getInt32(-1), value, offset, b->getInt32(WarpSize() - 1)});
-}
-
-// Helper function to emit call to SPIR shfl_down intrinsic.
-llvm::Value* EmitSPIRShflDown(llvm::Value* value, llvm::Value* offset,
-                              llvm::IRBuilder<>* b) {
-  CHECK_EQ(value->getType()->getPrimitiveSizeInBits(), 32);
-  if (value->getType()->isFloatTy()) {
-    return EmitDeviceFunctionCall(
-        "_Z34__spirv_GroupNonUniformShuffleDownffj",
-        {b->getInt32(3), value, offset}, {U32, F32, U32}, F32,
-        llvm::AttrBuilder(b->getContext())
-            .addAttribute(llvm::Attribute::NoUnwind)
-            .addAttribute(llvm::Attribute::Convergent),
-        b);
-  } else {
-    return EmitDeviceFunctionCall(
-        "_Z34__spirv_GroupNonUniformShuffleDownjjj",
-        {b->getInt32(3), value, offset}, {U32, U32, U32}, U32,
-        llvm::AttrBuilder(b->getContext())
-            .addAttribute(llvm::Attribute::NoUnwind)
-            .addAttribute(llvm::Attribute::Convergent),
-        b);
-  }
-}
-
-llvm::Value* EmitFullWarpShuffleDown(
-    llvm::Value* value, llvm::Value* offset, llvm::IRBuilder<>* builder,
-    const se::DeviceDescription& gpu_device_info) {
-  int bit_width = value->getType()->getPrimitiveSizeInBits();
-  llvm::Module* module = builder->GetInsertBlock()->getModule();
-  llvm::Triple target_triple = llvm::Triple(module->getTargetTriple());
-
-  // Special case for efficiency
-  if (value->getType()->isFloatTy() && bit_width == 32) {
-    if (target_triple.isNVPTX()) {
-      return EmitNVPTXShflDown(value, offset, builder);
-    } else if (target_triple.getArch() == llvm::Triple::amdgcn) {
-      if (gpu_device_info.rocm_compute_capability().gfx9_mi100_or_later()) {
-        return EmitAMDGPUShflDownSwizzle(value, offset, builder);
-      }
-      return EmitAMDGPUShflDown(value, offset, builder);
-    } else if (target_triple.isSPIR()) {
-      return EmitSPIRShflDown(value, offset, builder);
-    } else {
-      LOG(FATAL) << "Invalid triple " << target_triple.str();
-    }
-  }
-
-  // We must split values wider than 32 bits as the "shfl" instruction operates
-  // on 32-bit values.
-  int num_segments = CeilOfRatio(bit_width, 32);
-  llvm::Value* x = builder->CreateBitCast(
-      builder->CreateZExt(
-          builder->CreateBitCast(value, builder->getIntNTy(bit_width)),
-          builder->getIntNTy(32 * num_segments)),
-      llvm::VectorType::get(builder->getInt32Ty(), num_segments, false));
-  for (int i = 0; i < num_segments; ++i) {
-    llvm::Value* insert_val;
-    if (target_triple.isNVPTX()) {
-      insert_val = EmitNVPTXShflDown(builder->CreateExtractElement(x, i),
-                                     offset, builder);
-    } else if (target_triple.getArch() == llvm::Triple::amdgcn) {
-      if (gpu_device_info.rocm_compute_capability().gfx9_mi100_or_later()) {
-        insert_val = EmitAMDGPUShflDownSwizzle(
-            builder->CreateExtractElement(x, i), offset, builder);
-      } else {
-        insert_val = EmitAMDGPUShflDown(builder->CreateExtractElement(x, i),
-                                        offset, builder);
-      }
-    } else if (target_triple.isSPIR()) {
-      insert_val = EmitSPIRShflDown(builder->CreateExtractElement(x, i), offset,
-                                    builder);
-    } else {
-      LOG(FATAL) << "Invalid triple " << target_triple.str();
-    }
-    x = builder->CreateInsertElement(x, insert_val, i);
-  }
-  return builder->CreateBitCast(
-      builder->CreateTrunc(
-          builder->CreateBitCast(x, builder->getIntNTy(32 * num_segments)),
-          builder->getIntNTy(bit_width)),
-      value->getType());
-}
-
-llvm::Value* IsBlock0Thread0(llvm::IRBuilder<>* b) {
+llvm::Value* IsBlock0Thread0(llvm::IRBuilderBase* b) {
   llvm::Value* is_thread0 = b->CreateICmpEQ(
       b->getInt32(0),
       EmitCallToTargetIntrinsic(TargetIntrinsicID::kThreadIdx, {}, {}, b));
@@ -492,6 +348,9 @@ absl::StatusOr<bool> CanEmitFusedDynamicUpdateSliceInPlaceForGpu(
               user_start_indices != dus_start_indices) {
             return false;
           }
+        } else if (user != dus &&
+                   user.opcode() == HloOpcode::kDynamicUpdateSlice) {
+          return false;
         } else if (user != dus && !user.instruction().IsElementwise() &&
                    user.opcode() != HloOpcode::kBitcast &&
                    user.opcode() != HloOpcode::kTuple) {
@@ -696,7 +555,7 @@ void VerifyModule(const llvm::Module& module) {
 }
 
 llvm::Type* GetIndexTypeForKernel(const HloInstruction* hlo,
-                                  int64_t launch_size, llvm::IRBuilder<>* b) {
+                                  int64_t launch_size, llvm::IRBuilderBase* b) {
   // Find the unnested hlo instruction for which the kernel is generated for.
   const HloInstruction* unnested_hlo = hlo;
   const HloComputation* computation = hlo->parent();
@@ -748,14 +607,6 @@ llvm::Type* GetIndexTypeForKernel(const HloInstruction* hlo,
   return b->getInt32Ty();
 }
 
-bool IsAMDGPU(const llvm::Module* module) {
-  return llvm::Triple(module->getTargetTriple()).isAMDGPU();
-}
-
-bool IsSPIR(const llvm::Module* module) {
-  return llvm::Triple(module->getTargetTriple()).isSPIR();
-}
-
 absl::StatusOr<DenseDataIntermediate> LiteralToXlaFormat(
     const Literal& literal) {
   PrimitiveType element_type = literal.shape().element_type();
@@ -786,6 +637,153 @@ absl::StatusOr<std::string> GetProtoFingerprint(
   std::string result;
   TF_RET_CHECK(tsl::SerializeToStringDeterministic(proto, &result));
   return absl::WebSafeBase64Escape(result);
+}
+
+std::optional<std::string> GetCustomFusionConfigName(
+    const HloInstruction* instr) {
+  if (instr->opcode() != HloOpcode::kFusion ||
+      instr->fusion_kind() != HloInstruction::FusionKind::kCustom) {
+    return std::nullopt;
+  }
+  absl::StatusOr<GpuBackendConfig> backend_config =
+      instr->backend_config<GpuBackendConfig>();
+  if (!backend_config.ok() || !backend_config->has_fusion_backend_config()) {
+    return std::nullopt;
+  }
+  const FusionBackendConfig& fusion_backend_config =
+      backend_config->fusion_backend_config();
+  if (!fusion_backend_config.has_custom_fusion_config()) {
+    return std::nullopt;
+  }
+  return fusion_backend_config.custom_fusion_config().name();
+}
+
+bool IsDynamicSliceFusion(const HloInstruction* instr) {
+  std::optional<std::string> name = GetCustomFusionConfigName(instr);
+  return name == kDynamicSliceFusionWithStaticAddressComputationConfigName ||
+         name == kDynamicSliceFusionWithDynamicAddressComputationConfigName;
+}
+
+bool IsDynamicMemcpyFusion(const HloInstruction* instr) {
+  absl::StatusOr<GpuBackendConfig> backend_config =
+      instr->backend_config<GpuBackendConfig>();
+  return backend_config.ok() &&
+         backend_config->fusion_backend_config().kind() ==
+             kDynamicMemcpyFusionKind;
+}
+
+std::optional<InductionVariableFunctionalDependency>
+ResolveFunctionalDependencyOnInductionVariable(
+    absl::Span<const HloInstruction* const> call_stack,
+    const HloInstruction* parameter) {
+  if (call_stack.empty()) {
+    return std::nullopt;
+  }
+
+  VLOG(5) << "Looking for defining while loop of " << parameter->name();
+
+  // Walk up the call stack, tracking the origin of `parameter`.
+  const HloInstruction* argument = parameter;
+  auto call_stack_it = call_stack.rbegin();
+  auto call_stack_end = call_stack.rend();
+  for (; call_stack_it != call_stack_end &&
+         argument->opcode() == HloOpcode::kParameter &&
+         ((*call_stack_it)->opcode() == HloOpcode::kFusion ||
+          (*call_stack_it)->opcode() == HloOpcode::kAsyncStart ||
+          (*call_stack_it)->opcode() == HloOpcode::kCall);
+       ++call_stack_it) {
+    argument = (*call_stack_it)->operand(argument->parameter_number());
+  }
+
+  if (call_stack_it == call_stack_end) {
+    return std::nullopt;
+  }
+
+  VLOG(5) << "Arrived at " << argument->name() << " in "
+          << (*call_stack_it)->name();
+
+  // Find a unique parameter and a gte in the transitive dependencies of
+  // `argument`.
+  const HloInstruction* unique_param = nullptr;
+  const HloInstruction* unique_gte = nullptr;
+  absl::flat_hash_set<const HloInstruction*> seen{argument};
+  std::queue<const HloInstruction*> queue;
+  queue.push(argument);
+  while (!queue.empty()) {
+    const auto* instruction = queue.front();
+    queue.pop();
+
+    if (instruction->opcode() == HloOpcode::kCustomCall ||
+        instruction->HasSideEffect()) {
+      VLOG(5) << "Found an unsafe operation.";
+      return std::nullopt;
+    }
+
+    if (instruction->opcode() == HloOpcode::kParameter) {
+      if (unique_param || !instruction->shape().IsTuple()) {
+        VLOG(5) << "Failed to match parameters.";
+        return std::nullopt;
+      }
+      unique_param = instruction;
+    }
+
+    if (instruction->opcode() == HloOpcode::kGetTupleElement) {
+      if (unique_gte) {
+        VLOG(5) << "Found non-unique GTEs.";
+        return std::nullopt;
+      }
+      unique_gte = instruction;
+    }
+
+    for (auto* operand : instruction->operands()) {
+      if (seen.insert(operand).second) {
+        queue.push(operand);
+      }
+    }
+  }
+
+  if (!unique_param || !unique_gte || unique_gte->operand(0) != unique_param) {
+    VLOG(5) << "Did not find a parameter or GTE or they don't match.";
+    return std::nullopt;
+  }
+
+  VLOG(5) << "Parameter and GTE: " << unique_param->name() << ", "
+          << unique_gte->name();
+
+  // Continue walking up through call instructions.
+  while (call_stack_it != call_stack_end &&
+         (*call_stack_it)->opcode() == HloOpcode::kCall &&
+         unique_param->opcode() == HloOpcode::kParameter) {
+    unique_param = (*call_stack_it)->operand(unique_param->parameter_number());
+    ++call_stack_it;
+  }
+
+  // Find the while loop for 'unique_param'.
+  auto while_instr_it = std::find_if(
+      call_stack_it, call_stack_end, [&](const HloInstruction* instr) {
+        return instr->opcode() == HloOpcode::kWhile &&
+               unique_param == instr->while_body()->parameter_instruction(0);
+      });
+
+  if (while_instr_it == call_stack_end) {
+    VLOG(5) << "Did not find a while loop.";
+    return std::nullopt;
+  }
+
+  auto config =
+      (*while_instr_it)->backend_config<xla::WhileLoopBackendConfig>();
+  if (!config.ok() || !config->has_known_induction_variable() ||
+      unique_gte->tuple_index() !=
+          config->known_induction_variable().tuple_index()) {
+    VLOG(5) << "Failed to verify that the offset depends on the induction "
+               "variable.";
+    return std::nullopt;
+  }
+
+  VLOG(5) << "While loop for " << parameter->name() << ": "
+          << (*while_instr_it)->name();
+  return InductionVariableFunctionalDependency{argument, *while_instr_it,
+                                               unique_gte};
 }
 
 }  // namespace gpu

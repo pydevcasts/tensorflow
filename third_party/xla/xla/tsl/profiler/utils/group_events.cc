@@ -30,16 +30,19 @@ limitations under the License.
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/functional/bind_front.h"
+#include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 #include "xla/tsl/lib/gtl/map_util.h"
+#include "xla/tsl/platform/env.h"
+#include "xla/tsl/platform/types.h"
 #include "xla/tsl/profiler/utils/tf_xplane_visitor.h"
+#include "xla/tsl/profiler/utils/timespan.h"
 #include "xla/tsl/profiler/utils/xplane_builder.h"
 #include "xla/tsl/profiler/utils/xplane_schema.h"
 #include "xla/tsl/profiler/utils/xplane_utils.h"
 #include "xla/tsl/profiler/utils/xplane_visitor.h"
 #include "tsl/platform/dso_loader.h"
-#include "tsl/platform/env.h"
-#include "tsl/platform/types.h"
+#include "tsl/profiler/protobuf/xplane.pb.h"
 
 namespace tsl {
 namespace profiler {
@@ -378,6 +381,12 @@ void EventForest::ConnectIntraThread(XPlane* plane, XPlaneVisitor* visitor,
                                      ContextGroupMap* context_groups) {
   bool is_host_plane = (visitor->Name() == kHostThreadsPlaneName);
   for (auto& line : *plane->mutable_lines()) {
+    if (line.name() == kTensorCoreSyncFlagLineName ||
+        line.name() == kSparseCoreSyncsLineName) {
+      VLOG(1) << "Skipping Xline with name: " << line.name()
+              << " in plane: " << visitor->Name();
+      continue;
+    }
     std::vector<EventNode*> parent_nodes;
     for (auto& event : *line.mutable_events()) {
       XEventVisitor event_visitor(visitor, &line, &event);
@@ -905,6 +914,30 @@ void GroupXplaneEvents(tensorflow::profiler::XPlane* plane,
       group_line = nullptr;
     } else {  // host loop
       if (group_line) {
+        // Determine whether the module line has been grouped.
+        bool is_grouped = false;
+        for (XEvent& event : *module_line->mutable_events()) {
+          XEventVisitor module_visitor(&plane_visitor, module_line, &event);
+          if (module_visitor.GetStat(StatType::kGroupId).has_value()) {
+            is_grouped = true;
+            break;
+          }
+        }
+        if (!is_grouped) {
+          // If the module line has not been grouped, then:
+          // (1) Assign group_id to each step event.
+          int32_t group_id = 0;
+          for (XEvent& event : *step_line->mutable_events()) {
+            XEventBuilder step_builder(step_line, &plane_builder, &event);
+            XEventVisitor step_visitor(&plane_visitor, step_line, &event);
+            if (!step_visitor.GetStat(StatType::kGroupId).has_value()) {
+              step_builder.AddStatValue(*group_id_stat_metadata, group_id++);
+            }
+          }
+          // (2) Group the module events nested by the step events.
+          GroupLine(*group_id_stat_metadata, plane_visitor, *step_line,
+                    &plane_builder, module_line);
+        }
         // Host loop steps take the group_id from their module.
         GroupLine(*group_id_stat_metadata, plane_visitor, *group_line,
                   &plane_builder, step_line);

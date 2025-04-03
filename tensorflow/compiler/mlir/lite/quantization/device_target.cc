@@ -20,7 +20,6 @@ limitations under the License.
 #include <functional>
 #include <optional>
 
-#include "absl/types/optional.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Casting.h"
@@ -43,7 +42,7 @@ constexpr int k32Bits = 32;
 constexpr unsigned kSigned = QuantizationFlags::Signed;
 
 DeviceTarget::DeviceTarget(MLIRContext* ctx) : ctx_(ctx) {
-  f32_ = FloatType::getF32(ctx_);
+  f32_ = Float32Type::get(ctx_);
   i8_ = IntegerType::get(ctx_, k8Bits);
   i8_min_ = QuantizedType::getDefaultMinimumForInteger(kSigned, k8Bits);
   i8_max_ = QuantizedType::getDefaultMaximumForInteger(kSigned, k8Bits);

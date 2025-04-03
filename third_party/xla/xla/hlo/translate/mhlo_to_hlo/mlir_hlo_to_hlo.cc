@@ -25,6 +25,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "mhlo/transforms/passes.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -63,6 +64,8 @@ limitations under the License.
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "stablehlo/dialect/Base.h"
+#include "stablehlo/dialect/StablehloOps.h"
+#include "stablehlo/transforms/Passes.h"
 #include "xla/array.h"
 #include "xla/comparison_util.h"
 #include "xla/debug_options_flags.h"
@@ -92,22 +95,22 @@ limitations under the License.
 #include "xla/mlir/utils/type_util.h"
 #include "xla/mlir_hlo/mhlo/IR/hlo_ops.h"
 #include "xla/mlir_hlo/mhlo/transforms/passes.h"
+#include "xla/mlir_hlo/stablehlo_ext/transforms/passes.h"
 #include "xla/primitive_util.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/platform/types.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
-#include "tsl/platform/types.h"
 
 using ::int64_t;
 using ::tsl::int16;
 using ::tsl::int32;
 using ::tsl::int8;
-using ::tsl::StatusOr;  // TENSORFLOW_STATUS_OK
 using ::tsl::uint16;
 using ::tsl::uint32;
 using ::tsl::uint64;
@@ -127,11 +130,14 @@ constexpr char kApproxTopK[] = "ApproxTopK";
 constexpr char kBackendConfig[] = "backend_config";
 constexpr char kCallTargetName[] = "call_target_name";
 constexpr char kCalledComputations[] = "called_computations";
+constexpr char kChannelId[] = "channel_id";
 constexpr char kHasSideEffect[] = "has_side_effect";
 constexpr char kIsFallback[] = "is_fallback";
+constexpr char kRaggedAllToAll[] = "ragged_all_to_all";
 constexpr char kRecallTarget[] = "recall_target";
 constexpr char kReductionDim[] = "reduction_dim";
 constexpr char kReductionInputSizeOverride[] = "reduction_input_size_override";
+constexpr char kReplicaGroups[] = "replica_groups";
 constexpr char kTopK[] = "top_k";
 
 // MHLO attributes. Module level attributes require namespacing.
@@ -483,6 +489,55 @@ static xla::DotDimensionNumbers Convert_dot_dimension_numbers(
   return dot_dimension_numbers;
 }
 
+static xla::RaggedDotDimensionNumbers Convert_ragged_dot_dimension_numbers(
+    mlir::mhlo::RaggedDotDimensionNumbersAttr
+        ragged_dot_dimension_numbers_attr) {
+  mlir::mhlo::DotDimensionNumbersAttr dot_dimension_numbers_attr =
+      ragged_dot_dimension_numbers_attr.getDotDimensionNumbers();
+
+  xla::DotDimensionNumbers dot_dimension_numbers;
+  xla::RaggedDotDimensionNumbers ragged_dot_dimension_numbers;
+
+  auto rhs_contracting_dimensions =
+      dot_dimension_numbers_attr.getRhsContractingDimensions();
+  auto lhs_contracting_dimensions =
+      dot_dimension_numbers_attr.getLhsContractingDimensions();
+  auto rhs_batch_dimensions =
+      dot_dimension_numbers_attr.getRhsBatchingDimensions();
+  auto lhs_batch_dimensions =
+      dot_dimension_numbers_attr.getLhsBatchingDimensions();
+
+  for (const auto& val : rhs_contracting_dimensions) {
+    dot_dimension_numbers.add_rhs_contracting_dimensions(val);
+  }
+  for (const auto& val : lhs_contracting_dimensions) {
+    dot_dimension_numbers.add_lhs_contracting_dimensions(val);
+  }
+
+  for (const auto& val : rhs_batch_dimensions) {
+    dot_dimension_numbers.add_rhs_batch_dimensions(val);
+  }
+
+  for (const auto& val : lhs_batch_dimensions) {
+    dot_dimension_numbers.add_lhs_batch_dimensions(val);
+  }
+  *ragged_dot_dimension_numbers.mutable_dot_dimension_numbers() =
+      dot_dimension_numbers;
+
+  auto lhs_ragged_dimensions =
+      ragged_dot_dimension_numbers_attr.getLhsRaggedDimensions();
+  auto rhs_group_dimensions =
+      ragged_dot_dimension_numbers_attr.getRhsGroupDimensions();
+  for (const auto& val : lhs_ragged_dimensions) {
+    ragged_dot_dimension_numbers.add_lhs_ragged_dimensions(val);
+  }
+  for (const auto& val : rhs_group_dimensions) {
+    ragged_dot_dimension_numbers.add_rhs_group_dimensions(val);
+  }
+
+  return ragged_dot_dimension_numbers;
+}
+
 static xla::SparsityDescriptor Convert_sparsity_descriptor(
     mlir::mhlo::SparsityDescriptorAttr sparsity_attr, bool is_lhs) {
   xla::SparsityDescriptor sparsity_descriptor;
@@ -584,6 +639,39 @@ static xla::ScatterDimensionNumbers Convert_scatter_dimension_numbers(
 
   output.set_index_vector_dim(input.getIndexVectorDim());
   return output;
+}
+
+// Converts ResultAccuracyAttr to XLA ResultAccuracy proto.
+static xla::ResultAccuracy Convert_result_accuracy(
+    std::optional<mlir::mhlo::ResultAccuracyAttr>
+        optional_result_accuracy_attr) {
+  if (!optional_result_accuracy_attr.has_value()) return xla::ResultAccuracy();
+
+  auto result_accuracy = xla::ResultAccuracy();
+  if (optional_result_accuracy_attr.value().getMode().getValue() ==
+      mlir::mhlo::ResultAccuracyMode::TOLERANCE) {
+    result_accuracy.mutable_tolerance()->set_atol(
+        optional_result_accuracy_attr.value().getAtol().convertToDouble());
+    result_accuracy.mutable_tolerance()->set_rtol(
+        optional_result_accuracy_attr.value().getRtol().convertToDouble());
+    result_accuracy.mutable_tolerance()->set_ulps(
+        optional_result_accuracy_attr.value().getUlps());
+  } else {
+    xla::ResultAccuracy::Mode mode;
+    auto result_accuracy_mode =
+        ::mlir::mhlo::stringifyResultAccuracyMode(
+            optional_result_accuracy_attr.value().getMode().getValue())
+            .str();
+    if (xla::ResultAccuracy::Mode_Parse(result_accuracy_mode, &mode)) {
+      result_accuracy.set_mode(mode);
+    } else {
+      auto* context = optional_result_accuracy_attr.value().getContext();
+      mlir::emitError(mlir::UnknownLoc::get(context))
+          << "unexpected result accuracy mode " << result_accuracy_mode;
+      return xla::ResultAccuracy();
+    }
+  }
+  return result_accuracy;
 }
 
 // Returns an OpSharding proto from the "sharding" attribute of the op. If the
@@ -964,10 +1052,11 @@ bool SimplyReturnedOp(mlir::Operation* op) {
   return false;
 }
 
-void BuildGetTupleElementsForTupleResults(mlir::Operation* op, xla::XlaOp tuple,
-                                          OpLoweringContext ctx,
-                                          unsigned num_implicit_results = 0) {
-  const std::optional<xla::OpSharding>& sharding = ctx.builder->sharding();
+void BuildGetTupleElementsForTupleResults(
+    mlir::Operation* op, xla::XlaOp tuple, xla::XlaBuilder* builder,
+    llvm::DenseMap<mlir::Value, xla::XlaOp>& values,
+    unsigned num_implicit_results = 0) {
+  const std::optional<xla::OpSharding>& sharding = builder->sharding();
   if (sharding.has_value()) {
     bool is_tuple_sharding = sharding->type() == xla::OpSharding::TUPLE;
     assert(!is_tuple_sharding || (op->getNumResults() + num_implicit_results ==
@@ -976,21 +1065,39 @@ void BuildGetTupleElementsForTupleResults(mlir::Operation* op, xla::XlaOp tuple,
       // If `sharding` is not a tuple sharding, then every `get-tuple-element`
       // gets the same sharding.
       xla::XlaScopedShardingAssignment scoped_sharding(
-          ctx.builder,
+          builder,
           is_tuple_sharding ? sharding->tuple_shardings(index) : sharding);
-      (*ctx.values)[result] = xla::GetTupleElement(tuple, index);
+      values[result] = xla::GetTupleElement(tuple, index);
     }
   } else {
-    xla::XlaScopedShardingAssignment scoped_sharding(ctx.builder, std::nullopt);
+    xla::XlaScopedShardingAssignment scoped_sharding(builder, std::nullopt);
     for (auto [index, result] : llvm::enumerate(op->getResults())) {
-      (*ctx.values)[result] = xla::GetTupleElement(tuple, index);
+      values[result] = xla::GetTupleElement(tuple, index);
     }
   }
+}
+
+void BuildGetTupleElementsForTupleResults(mlir::Operation* op, xla::XlaOp tuple,
+                                          OpLoweringContext ctx,
+                                          unsigned num_implicit_results = 0) {
+  BuildGetTupleElementsForTupleResults(op, tuple, ctx.builder, *ctx.values,
+                                       num_implicit_results);
 }
 
 }  // namespace
 
 namespace mlir {
+
+namespace stablehlo {
+namespace {
+
+LogicalResult ExportXlaOp(ConstantOp op, OpLoweringContext ctx) {
+  return failure();
+}
+
+}  // namespace
+}  // namespace stablehlo
+
 namespace mhlo {
 namespace {
 LogicalResult ExportXlaOp(CollectiveBroadcastOp op, OpLoweringContext ctx) {
@@ -1535,8 +1642,11 @@ LogicalResult ExportXlaOp(BroadcastInDimOp op, OpLoweringContext ctx) {
   if (failed(GetXlaOp(op.getOperand(), value_map, &operand, op)))
     return failure();
 
+  // Use TypeToShape to handle bounded dynamism.
+  // HLO expects broadcast sizes to use the bound's value, not kDynamic.
+  xla::Shape shape = xla::TypeToShape(type);
   value_map[op] =
-      BroadcastInDim(operand, Convert_ArrayRef(type.getShape()),
+      BroadcastInDim(operand, shape.dimensions(),
                      Convert_broadcast_dimensions(op.getBroadcastDimensions()));
   return success();
 }
@@ -1561,7 +1671,9 @@ LogicalResult ExportXlaOp(CosineOp op, OpLoweringContext ctx) {
   xla::XlaOp arg;
   if (failed(GetXlaOp(*op.getODSOperands(0).begin(), value_map, &arg, op)))
     return mlir::failure();
-  auto xla_result = xla::Cos(Unwrap(arg));
+  xla::ResultAccuracy result_accuracy =
+      Convert_result_accuracy(op.getResultAccuracy());
+  auto xla_result = xla::Cos(Unwrap(arg), result_accuracy);
   value_map[result] = xla_result;
   return mlir::success();
 }
@@ -1570,9 +1682,11 @@ LogicalResult ExportXlaOp(TanOp op, OpLoweringContext ctx) {
   auto& value_map = *ctx.values;
   auto result = op.getResult();
   xla::XlaOp arg;
+  xla::ResultAccuracy result_accuracy =
+      Convert_result_accuracy(op.getResultAccuracy());
   if (failed(GetXlaOp(*op.getODSOperands(0).begin(), value_map, &arg, op)))
     return mlir::failure();
-  auto xla_result = xla::Tan(Unwrap(arg));
+  auto xla_result = xla::Tan(Unwrap(arg), result_accuracy);
   value_map[result] = xla_result;
   return mlir::success();
 }
@@ -1618,6 +1732,36 @@ LogicalResult ExportXlaOp(DotGeneralOp op, OpLoweringContext ctx) {
   auto xlaOp = xla::DotGeneral(
       lhs, rhs, Convert_dot_dimension_numbers(op.getDotDimensionNumbers()),
       Unwrap(precision_config), preferred_element_type);
+
+  value_map[op] = xlaOp;
+  return mlir::success();
+}
+
+LogicalResult ExportXlaOp(RaggedDotOp op, OpLoweringContext ctx) {
+  auto& value_map = *ctx.values;
+  xla::XlaOp lhs, rhs, group_sizes;
+  if (failed(GetXlaOp(op.getLhs(), value_map, &lhs, op)))
+    return mlir::failure();
+  if (failed(GetXlaOp(op.getRhs(), value_map, &rhs, op)))
+    return mlir::failure();
+  if (failed(GetXlaOp(op.getGroupSizes(), value_map, &group_sizes, op)))
+    return mlir::failure();
+  xla::PrimitiveType preferred_element_type =
+      xla::ConvertMlirTypeToPrimitiveType(getElementTypeOrSelf(op.getType()));
+
+  // Precision Config
+  auto precision_config = Convert_precision_config(op.getPrecisionConfig());
+  if (precision_config == nullptr) {
+    precision_config = std::make_unique<xla::PrecisionConfig>();
+  }
+  auto xlaOp = xla::RaggedDot(
+      /*lhs=*/lhs,
+      /*rhs=*/rhs,
+      /*group_sizes=*/group_sizes,
+      /*dimension_numbers=*/
+      Convert_ragged_dot_dimension_numbers(op.getRaggedDotDimensionNumbers()),
+      /*precision_config=*/Unwrap(precision_config),
+      /*preferred_element_type=*/preferred_element_type);
 
   value_map[op] = xlaOp;
   return mlir::success();
@@ -2178,6 +2322,32 @@ LogicalResult ExportXlaOp(CustomCallOp op, OpLoweringContext ctx) {
     }
     BuildGetTupleElementsForTupleResults(op, cc_op, ctx);
     return success();
+  } else if (op.getCallTargetName() == kRaggedAllToAll) {
+    auto backend_config =
+        mlir::dyn_cast_or_null<mlir::DictionaryAttr>(op.getBackendConfigAttr());
+    auto isSupportedAttrName = [](NamedAttribute attr) {
+      auto name = attr.getName();
+      return name == kCallTargetName || name == kBackendConfig ||
+             name == kApiVersion || name == kCalledComputations ||
+             name == kHasSideEffect || name == kMhloSharding;
+    };
+    for (const auto& attr : op->getAttrs()) {
+      if (!isSupportedAttrName(attr))
+        return op.emitOpError()
+               << attr.getName().getValue()
+               << " is not a supported attribute for RaggedAllToAll";
+    }
+    DenseIntElementsAttr replica_groups =
+        backend_config.getAs<DenseIntElementsAttr>(kReplicaGroups);
+    xla::ChannelHandle channel_handle;
+    channel_handle.set_handle(
+        backend_config.getAs<IntegerAttr>(kChannelId).getInt());
+    channel_handle.set_type(xla::ChannelHandle::CHANNEL_TYPE_INVALID);
+    xla::XlaOp ragged_all_to_all_op =
+        RaggedAllToAll(args[0], args[1], args[2], args[3], args[4], args[5],
+                       Convert_replica_groups(replica_groups), channel_handle);
+    value_map[op.getResult(0)] = ragged_all_to_all_op;
+    return success();
   }
 
   if (op.getCalledComputations().size() > 1)
@@ -2428,14 +2598,54 @@ LogicalResult ExportXlaOp(RecvOp op, OpLoweringContext ctx) {
   else
     data_shape = xla::ShapeUtil::MakeTupleShape(subshapes);
 
-  token = xla::internal::XlaBuilderFriend::BuildRecv(
-      ctx.builder, token, data_shape,
-      Convert_channel_handle(op.getChannelHandle()), op.getIsHostTransfer());
-  xla::XlaOp xla_result = xla::internal::XlaBuilderFriend::BuildRecvDone(
-      ctx.builder, token, data_shape,
-      Convert_channel_handle(op.getChannelHandle()), op.getIsHostTransfer());
+  auto get_sharding = [](const xla::OpSharding& sharding) {
+    xla::OpSharding ret;
+    if (sharding.type() != xla::OpSharding::TUPLE) {
+      ret = sharding;
+    } else {
+      ret = sharding.tuple_shardings(0);
+    }
+    return ret;
+  };
+  if (ctx.builder->sharding().has_value()) {
+    // HLO Recv needs a 3-tuple sharding. Get the sharding from the builder and
+    // make it a 3-tuple sharding.
+    std::optional<xla::OpSharding> sharding = *ctx.builder->sharding();
+    xla::OpSharding single_sharding = get_sharding(*sharding);
+    auto* tuple_shardings = sharding->mutable_tuple_shardings();
+    tuple_shardings->Clear();
+    for (int i = 0; i < 3; ++i) {
+      tuple_shardings->Add(xla::OpSharding(single_sharding));
+    }
+    xla::XlaScopedShardingAssignment sharding_scope(ctx.builder, sharding);
+    token = xla::internal::XlaBuilderFriend::BuildRecv(
+        ctx.builder, token, data_shape,
+        Convert_channel_handle(op.getChannelHandle()), op.getIsHostTransfer());
+  } else {
+    token = xla::internal::XlaBuilderFriend::BuildRecv(
+        ctx.builder, token, data_shape,
+        Convert_channel_handle(op.getChannelHandle()), op.getIsHostTransfer());
+  }
 
-  auto data_tuple_element = xla::GetTupleElement(xla_result, 0);
+  xla::XlaOp xla_result;
+  {
+    xla::XlaScopedShardingAssignment sharding_scope(ctx.builder,
+                                                    ctx.builder->sharding());
+    xla_result = xla::internal::XlaBuilderFriend::BuildRecvDone(
+        ctx.builder, token, data_shape,
+        Convert_channel_handle(op.getChannelHandle()), op.getIsHostTransfer());
+  }
+
+  xla::XlaOp data_tuple_element;
+  if (ctx.builder->sharding().has_value()) {
+    // HLO GetTupleElement needs a single sharding,
+    xla::XlaScopedShardingAssignment sharding_scope(
+        ctx.builder, get_sharding(*ctx.builder->sharding()));
+    data_tuple_element = xla::GetTupleElement(xla_result, 0);
+  } else {
+    data_tuple_element = xla::GetTupleElement(xla_result, 0);
+  }
+
   if (subshapes.size() == 1) {
     value_map[op.getResult(0)] = data_tuple_element;
   } else {
@@ -2670,9 +2880,25 @@ LogicalResult ExportXlaOp(SendOp op, OpLoweringContext ctx) {
   xla::XlaOp token;
   if (failed(GetXlaOp(op.getToken(), value_map, &token, op))) return failure();
 
-  token = xla::internal::XlaBuilderFriend::BuildSend(
-      ctx.builder, operand, token,
-      Convert_channel_handle(op.getChannelHandle()), op.getIsHostTransfer());
+  // SendOp has 1 result, but HLO Send has 3 results. Convert the sharding to a
+  // tuple sharding with 3 entries.
+  if (ctx.builder->sharding().has_value()) {
+    xla::OpSharding sharding = *ctx.builder->sharding();
+    const xla::OpSharding single_sharding = *ctx.builder->sharding();
+    sharding.set_type(xla::OpSharding::TUPLE);
+    auto* tuple_shardings = sharding.mutable_tuple_shardings();
+    tuple_shardings->Add(xla::OpSharding(single_sharding));
+    tuple_shardings->Add(xla::OpSharding(single_sharding));
+    tuple_shardings->Add(xla::OpSharding(single_sharding));
+    xla::XlaScopedShardingAssignment sharding_scope(ctx.builder, sharding);
+    token = xla::internal::XlaBuilderFriend::BuildSend(
+        ctx.builder, operand, token,
+        Convert_channel_handle(op.getChannelHandle()), op.getIsHostTransfer());
+  } else {
+    token = xla::internal::XlaBuilderFriend::BuildSend(
+        ctx.builder, operand, token,
+        Convert_channel_handle(op.getChannelHandle()), op.getIsHostTransfer());
+  }
   value_map[op] = xla::internal::XlaBuilderFriend::BuildSendDone(
       ctx.builder, token, Convert_channel_handle(op.getChannelHandle()),
       op.getIsHostTransfer());
@@ -2721,9 +2947,11 @@ mlir::LogicalResult ExportXlaOp(mlir::mhlo::SineOp op, OpLoweringContext ctx) {
   auto& value_map = *ctx.values;
   auto result = op.getResult();
   xla::XlaOp arg;
+  xla::ResultAccuracy result_accuracy =
+      Convert_result_accuracy(op.getResultAccuracy());
   if (failed(GetXlaOp(*op.getODSOperands(0).begin(), value_map, &arg, op)))
     return mlir::failure();
-  auto xla_result = xla::Sin(Unwrap(arg));
+  auto xla_result = xla::Sin(Unwrap(arg), result_accuracy);
   value_map[result] = xla_result;
   return mlir::success();
 }
@@ -2982,7 +3210,7 @@ LogicalResult ExportXlaOp(MinimumBroadcastShapesOp op, OpLoweringContext ctx) {
 }  // namespace mhlo
 }  // namespace mlir
 
-#include "xla/hlo/translate/mhlo_to_hlo/operator_writers.inc"
+#include "xla/hlo/translate/mhlo_to_hlo/hlo_op_writer.inc"
 
 namespace mlir {
 namespace {
@@ -3387,7 +3615,6 @@ LogicalResult ConvertToHloModule::LowerReturn(
                 /*fast_mem=*/false);
         if (!reshape.ok())
           return inst->emitError() << reshape.status().message();
-
         returns[index] = reshape.value();
       }
     }
@@ -3424,8 +3651,8 @@ LogicalResult ConvertToHloModule::Lower(
     ConvertToHloModule::ValueLoweringMap* value_lowering,
     xla::XlaOp* return_value) {
   // Explicitly fail for ops that are not supported for export.
-  if (inst->getDialect() !=
-          inst->getContext()->getLoadedDialect<mlir::mhlo::MhloDialect>() &&
+  if (!mlir::isa<mhlo::MhloDialect, stablehlo::StablehloDialect>(
+          inst->getDialect()) &&
       !mlir::isa<mlir::func::ConstantOp, mlir::arith::ConstantOp,
                  mlir::func::CallOp, mlir::tensor::CastOp,
                  mlir::func::ReturnOp>(inst)) {
@@ -3526,9 +3753,8 @@ LogicalResult ConvertToHloModule::LowerFunctionCall(
   // Use GetTupleElement for multiple outputs
   unsigned num_results = call_op.getNumResults();
   if (num_results > 1) {
-    for (unsigned i = 0; i != num_results; ++i) {
-      value_map[call_op.getResult(i)] = xla::GetTupleElement(call_result, i);
-    }
+    BuildGetTupleElementsForTupleResults(call_op, call_result, builder,
+                                         value_map);
   } else if (num_results == 1) {
     value_map[call_op.getResult(0)] = call_result;
   }
@@ -3889,9 +4115,18 @@ absl::Status PrepareForExport(mlir::ModuleOp module) {
     // Experimental support for exporting dynamic MHLO programs to HLO.
     // Only bounded dynamism is planned to be supported; unbounded dynamism
     // is out of scope for now.
+    //
+    // Shape -> MHLO
+    // Currently takes overhead if input is MHLO for MHLO->StableHLO, can
+    // be deleted once conversion can assume StableHLO input.
+    mlir::mhlo::HloLegalizeToStablehloPassOptions options;
+    options.allow_xla_features_ = true;
     pm.addNestedPass<mlir::func::FuncOp>(
-        mhlo::createSymbolicShapeOptimizationPass());
-    pm.addNestedPass<mlir::func::FuncOp>(mhlo::createShapeLegalizeToHloPass());
+        stablehlo_ext::createSymbolicShapeOptimizationPass());
+    pm.addPass(mhlo::createHloLegalizeToStablehloPass(options));
+    pm.addNestedPass<mlir::func::FuncOp>(
+        stablehlo::createShapeLegalizeToStablehloPass());
+    pm.addPass(mhlo::createStablehloLegalizeToHloPass());
   }
 
   mlir::BaseScopedDiagnosticHandler handler(module.getContext());

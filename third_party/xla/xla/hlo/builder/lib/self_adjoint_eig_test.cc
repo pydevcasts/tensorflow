@@ -31,9 +31,9 @@ limitations under the License.
 #include "xla/hlo/builder/lib/math.h"
 #include "xla/hlo/builder/lib/matrix.h"
 #include "xla/hlo/builder/xla_builder.h"
+#include "xla/hlo/testlib/test.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/test.h"
 #include "xla/tests/client_library_test_base.h"
 #include "xla/tests/test_macros.h"
 #include "xla/types.h"
@@ -126,10 +126,10 @@ XlaOp GetAverageAbsoluteError(XlaOp m1, XlaOp m2, XlaBuilder* builder) {
 XlaOp ComputeMatmulVWVt(SelfAdjointEigResult result, XlaBuilder* builder) {
   Shape shape = builder->GetShape(result.v).value();
   absl::Span<const int64_t> out_dims = shape.dimensions();
-  std::vector<int64_t> broadcast_dims(shape.rank() - 1);
+  std::vector<int64_t> broadcast_dims(shape.dimensions_size() - 1);
   std::iota(broadcast_dims.begin(), broadcast_dims.end(), 0);
 
-  broadcast_dims[shape.rank() - 2] = shape.rank() - 1;
+  broadcast_dims[shape.dimensions_size() - 2] = shape.dimensions_size() - 1;
   auto vw =
       Mul(result.v,
           BroadcastInDim(ConvertElementType(result.w, shape.element_type()),

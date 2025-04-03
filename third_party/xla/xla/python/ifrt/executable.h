@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -43,7 +44,7 @@ namespace xla {
 namespace ifrt {
 
 class Client;
-class CompileOptions;
+struct CompileOptions;
 struct DeserializeExecutableOptions;
 
 // Wraps a computation that has been partially compiled and can be loaded.
@@ -78,10 +79,10 @@ class Executable : public llvm::RTTIExtends<Executable, llvm::RTTIRoot> {
   // Returns a list of output `OpSharding`.
   virtual std::optional<std::vector<OpSharding>> GetOutputShardings() const = 0;
   // Returns a list of parameter layouts.
-  virtual absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtLayout>>>
+  virtual absl::StatusOr<std::vector<std::shared_ptr<const xla::PjRtLayout>>>
   GetParameterLayouts() const = 0;
   // Returns a list of output/result layouts.
-  virtual absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtLayout>>>
+  virtual absl::StatusOr<std::vector<std::shared_ptr<const xla::PjRtLayout>>>
   GetOutputLayouts() const = 0;
   // Returns an `HloModule` (optimized) per partition.
   virtual absl::StatusOr<std::vector<std::shared_ptr<HloModule>>>
@@ -97,12 +98,7 @@ class Executable : public llvm::RTTIExtends<Executable, llvm::RTTIRoot> {
   // Returns named values for cost properties of this executable (such as
   // operations, size of input/outputs, and run time estimate). Properties may
   // differ for different implementations and platforms.
-  virtual absl::StatusOr<xla::ifrt::AttributeMap> GetCostAnalysis() const = 0;
-
-  // Returns the compile options used to compile this executable.
-  // TODO(phawkins): consider removing this API and having the client remember
-  // the compile options used to create the executable.
-  virtual const CompileOptions* GetCompileOptions() const = 0;
+  virtual absl::StatusOr<AttributeMap> GetCostAnalysis() const = 0;
 
   static char ID;  // NOLINT
 };
@@ -126,6 +122,15 @@ struct ExecuteOptions {
   // If true, populate `ExecuteResult::status`. Otherwise, the status is left as
   // an invalid future.
   bool fill_status = false;
+
+  // Execution stream ID identifies the series of executions that must be
+  // executed in program order.  Executions with different execution stream IDs
+  // may be executed in any order and concurrently.
+  int64_t execution_stream_id = 0;
+
+  // Custom execution options specific to the runtime. The user and the runtime
+  // are responsible for ensuring version compatibility.
+  std::optional<AttributeMap> custom_options;
 
   absl::StatusOr<ExecuteOptionsProto> ToProto() const;
 
@@ -180,13 +185,20 @@ class LoadedExecutable
   // Returns a list of parameter Sharding.
   virtual std::optional<std::vector<OpSharding>> GetParameterShardings()
       const = 0;
+
+  // Returns the indices of parameters that will be donated whenever `Execute`
+  // gets called, provided they are not present in
+  // `execute_options.non_donatable_input_indices`.
+  virtual absl::StatusOr<absl::Span<const int>> GetDonatableInputIndices()
+      const = 0;
+
   // Returns a list of output OpSharding.
   virtual std::optional<std::vector<OpSharding>> GetOutputShardings() const = 0;
   // Returns a list of parameter layouts.
-  virtual absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtLayout>>>
+  virtual absl::StatusOr<std::vector<std::shared_ptr<const xla::PjRtLayout>>>
   GetParameterLayouts() const = 0;
   // Returns a list of output/result layouts.
-  virtual absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtLayout>>>
+  virtual absl::StatusOr<std::vector<std::shared_ptr<const xla::PjRtLayout>>>
   GetOutputLayouts() const = 0;
   // Return an HloModule (optimized) per partition.
   virtual absl::StatusOr<std::vector<std::shared_ptr<HloModule>>>
@@ -201,11 +213,11 @@ class LoadedExecutable
   // Returns named values for cost properties of this executable (such as
   // operations, size of input/outputs, and run time estimate). Properties may
   // differ for different implementations and platforms.
-  virtual absl::StatusOr<xla::ifrt::AttributeMap> GetCostAnalysis() const = 0;
+  virtual absl::StatusOr<AttributeMap> GetCostAnalysis() const = 0;
 
   // `LoadedExecutable` methods.
 
-  using ExecuteOptions = xla::ifrt::ExecuteOptions;
+  using ExecuteOptions = ::xla::ifrt::ExecuteOptions;
 
   // Result from an execution.
   struct ExecuteResult {
@@ -235,7 +247,7 @@ class LoadedExecutable
   // API).
   virtual absl::StatusOr<ExecuteResult> Execute(
       absl::Span<tsl::RCReference<Array>> args, const ExecuteOptions& options,
-      std::optional<tsl::RCReference<DeviceList>> devices) = 0;
+      std::optional<DeviceListRef> devices) = 0;
 
   // Deletes the executable from the devices. The operation may be asynchronous.
   // The returned future will have the result of the deletion on the devices.

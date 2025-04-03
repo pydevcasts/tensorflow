@@ -18,11 +18,14 @@ limitations under the License.
 
 #include <nanobind/nanobind.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <string>
 
+#include "absl/log/check.h"
 #include "tsl/platform/logging.h"
 #include "tsl/platform/protobuf.h"
 #include "tsl/profiler/protobuf/xplane.pb.h"

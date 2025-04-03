@@ -48,7 +48,7 @@ bool IsValidIntermediaryUser(const HloInstruction* instruction) {
   // Allow elementwise instructions, as they don't depend on the truncated
   // elements. In case of multi-output scatters, the resulting shape is a tuple.
   return instruction->IsElementwise() ||
-         instruction->opcode() == HloOpcode::kGetTupleElement;
+         HloPredicateIsOp<HloOpcode::kGetTupleElement>(instruction);
 }
 
 // Matches the "Scatter -> Elementwise (zero or more) -> Slice" pattern.
@@ -84,7 +84,7 @@ class ScatterSliceMatcher {
   // the original scatter dimensions. Return `false` if the update is not
   // possible.
   bool UpdateDimensions(const HloSliceInstruction* slice) {
-    int64_t rank = slice->shape().rank();
+    int64_t rank = slice->shape().dimensions_size();
     for (int64_t i = 0; i < rank; ++i) {
       if (slice->slice_starts(i) != 0 || slice->slice_strides(i) != 1) {
         return false;  // The slice is not a truncation.
@@ -145,10 +145,10 @@ class ScatterSliceMatcher {
 
 // Create a replacement operand for the scatter instruction.
 HloInstruction* CreateSliceFrom(HloInstruction* operand, const Shape& shape) {
-  std::vector<int64_t> start_indices(shape.rank(), 0);
-  std::vector<int64_t> limit_indices(shape.rank());
-  std::vector<int64_t> strides(shape.rank(), 1);
-  for (int64_t i = 0; i < shape.rank(); ++i) {
+  std::vector<int64_t> start_indices(shape.dimensions_size(), 0);
+  std::vector<int64_t> limit_indices(shape.dimensions_size());
+  std::vector<int64_t> strides(shape.dimensions_size(), 1);
+  for (int64_t i = 0; i < shape.dimensions_size(); ++i) {
     limit_indices[i] = shape.dimensions(i);
   }
   return operand->AddInstruction(HloInstruction::CreateSlice(
@@ -218,7 +218,7 @@ class ScatterSliceSimplifierVisitor : public DfsHloRewriteVisitor {
   absl::Status ReplaceUserRecursive(HloInstruction* user,
                                     HloInstruction* operand) {
     VLOG(3) << "Replacing scatter user " << user->name();
-    if (user->opcode() == HloOpcode::kSlice) {
+    if (HloPredicateIsOp<HloOpcode::kSlice>(user)) {
       return ReplaceInstruction(user, operand);
     }
 

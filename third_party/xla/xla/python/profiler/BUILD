@@ -1,5 +1,6 @@
-load("@local_tsl//tsl/platform:rules_cc.bzl", "cc_library")
+load("//xla:py_strict.bzl", "py_strict_test")
 load("//xla/tsl:tsl.default.bzl", "tsl_pybind_extension")
+load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
 
 # copybara:uncomment package(default_applicable_licenses = ["//tensorflow:license"])
 
@@ -13,10 +14,11 @@ cc_library(
     ],
     features = ["-use_header_modules"],
     visibility = [
-        "//perftools/accelerators/xprof/api/python:__pkg__",
         "//xla/python:__pkg__",
     ],
     deps = [
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@local_tsl//tsl/platform:env",
         "@local_tsl//tsl/platform:logging",
         "@local_tsl//tsl/platform:protobuf",
@@ -38,6 +40,22 @@ tsl_pybind_extension(
     visibility = ["//visibility:public"],
     deps = [
         ":profile_data_lib",
+        "@local_tsl//tsl/platform:protobuf",
+        "@local_tsl//tsl/profiler/protobuf:xplane_proto_cc",
         "@nanobind",
+    ],
+)
+
+py_strict_test(
+    name = "profile_data_test",
+    srcs = ["profile_data_test.py"],
+    tags = [
+        "no_oss",  # TODO(phawkins): This test passes, but requires --config=monolithic.
+        "optonly",
+    ],
+    deps = [
+        ":profile_data",
+        # copybara:uncomment "//pyglib:gfile",
+        "@absl_py//absl/testing:absltest",
     ],
 )

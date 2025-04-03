@@ -87,30 +87,32 @@ class SdyRoundTripShardMapExportPass
       mlir::StringAttr funcName = symbolTable.insert(funcOp);
 
       rewriter.setInsertionPoint(manualComputation);
-      stablehlo::CustomCallOp fullToShard;
+      stablehlo::CustomCallOp globalToLocalShape;
       mlir::ValueRange operands = manualComputation->getOperands();
       if (!operands.empty()) {
-        fullToShard = rewriter.create<stablehlo::CustomCallOp>(
+        globalToLocalShape = rewriter.create<stablehlo::CustomCallOp>(
             loc, manualCompBodyArgTypes, operands);
-        fullToShard.setCallTargetName(kGlobalToLocalShapeCallTargetName);
-        operands = fullToShard->getResults();
+        globalToLocalShape.setCallTargetName(kGlobalToLocalShapeCallTargetName);
+        globalToLocalShape.setHasSideEffect(true);
+        operands = globalToLocalShape->getResults();
       }
 
       auto callOp =
           rewriter.create<CallOp>(loc, localResultTypes, funcName, operands);
-      addFrontendAttribute(callOp, kInShardings,
+      setFrontendAttribute(callOp, kInShardings,
                            manualComputation.getInShardings());
-      addFrontendAttribute(callOp, kOutShardings,
+      setFrontendAttribute(callOp, kOutShardings,
                            manualComputation.getOutShardings());
-      addFrontendAttribute(callOp, kManualAxes,
+      setFrontendAttribute(callOp, kManualAxes,
                            manualComputation.getManualAxesAttr());
 
       mlir::ResultRange results = manualComputation->getResults();
       if (!results.empty()) {
-        auto shardToFull = rewriter.create<stablehlo::CustomCallOp>(
+        auto localToGlobalShape = rewriter.create<stablehlo::CustomCallOp>(
             loc, manualComputation.getResultTypes(), callOp->getResults());
-        shardToFull.setCallTargetName(kLocalToGlobalShapeCallTargetName);
-        results = shardToFull->getResults();
+        localToGlobalShape.setHasSideEffect(true);
+        localToGlobalShape.setCallTargetName(kLocalToGlobalShapeCallTargetName);
+        results = localToGlobalShape->getResults();
       }
       sdy::inlineRegionAndConvertTerminatorOp<mlir::func::ReturnOp>(
           manualCompBody, funcOp.getBody());

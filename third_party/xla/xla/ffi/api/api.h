@@ -101,6 +101,12 @@ inline std::ostream& operator<<(std::ostream& os,
       return os << "INVALID";
     case XLA_FFI_DataType_PRED:
       return os << "PRED";
+    case XLA_FFI_DataType_S1:
+      return os << "S1";
+    case XLA_FFI_DataType_S2:
+      return os << "S2";
+    case XLA_FFI_DataType_S4:
+      return os << "S4";
     case XLA_FFI_DataType_S8:
       return os << "S8";
     case XLA_FFI_DataType_S16:
@@ -109,6 +115,12 @@ inline std::ostream& operator<<(std::ostream& os,
       return os << "S32";
     case XLA_FFI_DataType_S64:
       return os << "S64";
+    case XLA_FFI_DataType_U1:
+      return os << "U1";
+    case XLA_FFI_DataType_U2:
+      return os << "U2";
+    case XLA_FFI_DataType_U4:
+      return os << "U4";
     case XLA_FFI_DataType_U8:
       return os << "U8";
     case XLA_FFI_DataType_U16:
@@ -131,6 +143,8 @@ inline std::ostream& operator<<(std::ostream& os,
       return os << "C128";
     case XLA_FFI_DataType_TOKEN:
       return os << "TOKEN";
+    case XLA_FFI_DataType_F4E2M1FN:
+      return os << "F4E2M1FN";
     case XLA_FFI_DataType_F8E5M2:
       return os << "F8E5M2";
     case XLA_FFI_DataType_F8E3M4:
@@ -145,6 +159,8 @@ inline std::ostream& operator<<(std::ostream& os,
       return os << "F8E5M2FNUZ";
     case XLA_FFI_DataType_F8E4M3FNUZ:
       return os << "F8E4M3FNUZ";
+    case XLA_FFI_DataType_F8E8M0FNU:
+      return os << "F8E8M0FNU";
   }
 }
 
@@ -224,19 +240,28 @@ class Ffi {
 
   // Registers FFI handler bundle with an XLA runtime under the given name on a
   // given platform.
-  static inline XLA_FFI_Error* RegisterStaticHandler(
+  static XLA_FFI_Error* RegisterStaticHandler(
       const XLA_FFI_Api* api, std::string_view name, std::string_view platform,
       XLA_FFI_Handler_Bundle bundle, XLA_FFI_Handler_Traits traits = 0);
 
   // Registers FFI execute handler with an XLA runtime under the given name on a
   // given platform.
-  static inline XLA_FFI_Error* RegisterStaticHandler(
+  static XLA_FFI_Error* RegisterStaticHandler(
       const XLA_FFI_Api* api, std::string_view name, std::string_view platform,
       XLA_FFI_Handler* execute, XLA_FFI_Handler_Traits traits = 0) {
     return RegisterStaticHandler(
         api, name, platform,
         XLA_FFI_Handler_Bundle{nullptr, nullptr, nullptr, execute}, traits);
   }
+
+  // Registers a custom type so that it can be used with State and UserData
+  // arguments to external FFI handlers. The `name` argument must be a unique
+  // identifier for the type, and duplicate registrations with the same name
+  // are not allowed. When successful, a unique ID will be returned by updating
+  // `type_id`.
+  static XLA_FFI_Error* RegisterTypeId(const XLA_FFI_Api* api,
+                                       std::string_view name,
+                                       XLA_FFI_TypeId* type_id);
 
  protected:
   template <typename... Args>
@@ -260,11 +285,9 @@ class Ffi {
                                                    size_t actual);
 };
 
-XLA_FFI_Error* Ffi::RegisterStaticHandler(const XLA_FFI_Api* api,
-                                          std::string_view name,
-                                          std::string_view platform,
-                                          XLA_FFI_Handler_Bundle bundle,
-                                          XLA_FFI_Handler_Traits traits) {
+inline XLA_FFI_Error* Ffi::RegisterStaticHandler(
+    const XLA_FFI_Api* api, std::string_view name, std::string_view platform,
+    XLA_FFI_Handler_Bundle bundle, XLA_FFI_Handler_Traits traits) {
   XLA_FFI_Handler_Register_Args args;
   args.struct_size = XLA_FFI_Handler_Register_Args_STRUCT_SIZE;
   args.extension_start = nullptr;
@@ -273,6 +296,17 @@ XLA_FFI_Error* Ffi::RegisterStaticHandler(const XLA_FFI_Api* api,
   args.bundle = bundle;
   args.traits = traits;
   return api->XLA_FFI_Handler_Register(&args);
+}
+
+inline XLA_FFI_Error* Ffi::RegisterTypeId(const XLA_FFI_Api* api,
+                                          std::string_view name,
+                                          XLA_FFI_TypeId* type_id) {
+  XLA_FFI_TypeId_Register_Args args;
+  args.struct_size = XLA_FFI_TypeId_Register_Args_STRUCT_SIZE;
+  args.extension_start = nullptr;
+  args.name = XLA_FFI_ByteSpan{name.data(), name.size()};
+  args.type_id = type_id;
+  return api->XLA_FFI_TypeId_Register(&args);
 }
 
 template <typename... Args>
@@ -568,7 +602,8 @@ inline Binding<ExecutionStage::kInstantiate> Ffi::BindInstantiate() {
 }
 
 //===----------------------------------------------------------------------===//
-// Template metaprogramming to automatially infer Binding from invocable object.
+// Template metaprogramming to automatically infer Binding from invocable
+// object.
 //===----------------------------------------------------------------------===//
 
 // A little bit of metaprogramming that automatically infers the binding schema
@@ -1158,9 +1193,7 @@ class DictionaryBase {
 
   size_t size() const { return attrs_->size; }
 
-  bool contains(std::string_view name) const {
-    return Find(name) < attrs_->size;
-  }
+  bool contains(std::string_view name) const { return Find(name).has_value(); }
 
  protected:
   template <typename T, typename... Ts>
@@ -1169,29 +1202,35 @@ class DictionaryBase {
   template <typename T>
   std::optional<T> get(std::string_view name,
                        DiagnosticEngine& diagnostic) const {
-    size_t idx = Find(name);
-    if (XLA_FFI_PREDICT_FALSE(idx >= attrs_->size)) {
+    std::optional<size_t> idx = Find(name);
+    if (XLA_FFI_PREDICT_FALSE(!idx.has_value())) {
       return diagnostic.Emit("Unexpected attribute: ") << name;
     }
 
-    XLA_FFI_AttrType attr_type = attrs_->types[idx];
-    void* attr = attrs_->attrs[idx];
+    XLA_FFI_AttrType attr_type = attrs_->types[*idx];
+    void* attr = attrs_->attrs[*idx];
     return AttrDecoding<T>::Decode(attr_type, attr, diagnostic);
   }
 
  private:
-  size_t Find(std::string_view name) const {
+  std::optional<size_t> Find(std::string_view name) const {
     XLA_FFI_ByteSpan** begin = attrs_->names;
     XLA_FFI_ByteSpan** end = begin + attrs_->size;
 
-    auto name_eq = [&](XLA_FFI_ByteSpan* attr) {
-      std::string_view name_view = {attr->ptr, attr->len};
-      return name_view == name;
+    auto eq = [](XLA_FFI_ByteSpan* a, std::string_view b) {
+      return std::string_view{a->ptr, a->len} == b;
     };
 
-    // TODO(ezhulenev): Attributes names sorted by name. We can use a binary
-    // search here instead of a linear scan.
-    return std::distance(begin, std::find_if(begin, end, name_eq));
+    auto cmp = [](XLA_FFI_ByteSpan* a, std::string_view b) {
+      return std::string_view{a->ptr, a->len} < b;
+    };
+
+    // Lower bound can be `end` if the attribute is not found, or the first
+    // attribute not ordered before the `name`.
+    auto lower_bound = std::lower_bound(begin, end, name, cmp);
+    return lower_bound == end || !eq(*lower_bound, name)
+               ? std::nullopt
+               : std::make_optional(std::distance(begin, lower_bound));
   }
 
   const XLA_FFI_Attrs* attrs_;
@@ -1662,22 +1701,6 @@ XLA_FFI_REGISTER_SCALAR_ATTR_DECODING(std::complex<double>,
                                       XLA_FFI_DataType_C128);
 
 #undef XLA_FFI_REGISTER_SCALAR_ATTR_DECODING
-
-template <>
-struct AttrDecoding<std::string_view> {
-  using Type = std::string_view;
-  static std::optional<std::string_view> Decode(XLA_FFI_AttrType type,
-                                                void* attr,
-                                                DiagnosticEngine& diagnostic) {
-    if (XLA_FFI_PREDICT_FALSE(type != XLA_FFI_AttrType_STRING)) {
-      return diagnostic.Emit("Wrong attribute type: expected ")
-             << XLA_FFI_AttrType_STRING << " but got " << type;
-    }
-
-    auto* span = reinterpret_cast<XLA_FFI_ByteSpan*>(attr);
-    return std::string_view(span->ptr, span->len);
-  }
-};
 
 //===----------------------------------------------------------------------===//
 // Automatic dictionary attributes to structs decoding.

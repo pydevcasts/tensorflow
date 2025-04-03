@@ -32,10 +32,11 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/pass/hlo_pass_pipeline.h"
+#include "xla/hlo/transforms/collectives/while_loop_all_reduce_code_motion_setup.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/literal_util.h"
 #include "xla/map_util.h"
-#include "xla/service/call_graph.h"
 #include "xla/service/collective_ops_utils.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/statusor.h"
@@ -64,7 +65,7 @@ struct MovableAllReduceContext {
 };
 
 bool IsZero(const HloInstruction* hlo) {
-  if (hlo->IsConstant() && hlo->shape().rank() == 0 &&
+  if (hlo->IsConstant() && hlo->shape().dimensions_size() == 0 &&
       hlo->literal().IsZero({})) {
     return true;
   }
@@ -961,11 +962,23 @@ absl::StatusOr<bool> WhileLoopAllReduceCodeMotion::Run(
                         HloReplicationAnalysis::RunWithPartialReplication(
                             module, /*cross_partition_spmd=*/true));
   }
+
+  // Run setup passes that may setup the add(all-reduce/reduce-scatter,
+  // accumulation_buffer) pattern.
+  if (run_setup_passes_) {
+    HloPassPipeline pipeline("while-loop-all-reduce-code-motion-setup");
+    if (enable_reduce_scatter_) {
+      pipeline.AddPass<ReorderReduceTranspose>();
+    }
+    pipeline.AddPass<ReorderConvertReduceAdd>(
+        /*enable_reduce_scatter=*/enable_reduce_scatter_);
+    TF_RETURN_IF_ERROR(pipeline.Run(module, execution_threads).status());
+  }
+
   // The while instruction's parent could be a while body for another while
   // loop. We recursively sink the all-reduce through nested while loops if
   // applicable by repeating this process.
   uint32_t count_all_reduce = 0, count_reduce_scatter = 0;
-  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module);
   // We process all callees of a computation before processing the computation,
   // so that when we process a computation, the all-reduce instructions that
   // need to be hoisted to the computation from its callees have been hoisted.
@@ -974,8 +987,8 @@ absl::StatusOr<bool> WhileLoopAllReduceCodeMotion::Run(
     // A computation could be the while body of multiple while instructions,
     // so we start from the computation and find all of its callers that is a
     // kWhile if there is any.
-    std::vector<HloInstruction*> computation_callers =
-        call_graph->GetComputationCallers(computation);
+    auto computation_callers =
+        computation->caller_instructions(HloOpcode::kWhile);
     std::vector<HloInstruction*> while_caller_instructions;
     for (HloInstruction* caller_instruction : computation_callers) {
       // For simplicity, we only support while instructions whose shape is
@@ -1049,11 +1062,6 @@ absl::StatusOr<bool> WhileLoopAllReduceCodeMotion::Run(
       }
       TF_RETURN_IF_ERROR(computation->ReplaceInstructionWithDifferentShape(
           all_reduce, all_reduce->mutable_operand(0)));
-    }
-    // Needs to rebuild the call graph after we remove instructions to avoid
-    // accessing removed instructions.
-    if (!all_reduce_to_accumulations.empty()) {
-      call_graph = CallGraph::Build(module);
     }
   }
   VLOG(2) << "Hoisted " << count_all_reduce << " all-reduce and "

@@ -15,16 +15,24 @@ limitations under the License.
 
 #include "xla/hlo/analysis/tuple_points_to_analysis.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <ostream>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -166,7 +174,8 @@ absl::Status TuplePointsToAnalysis::Analyze() {
   }
   // Run points-to analysis on fusion instructions in 'computation'.
   for (auto* instruction : fusion_instructions) {
-    TF_RETURN_IF_ERROR(instruction->fused_expression_root()->Accept(this));
+    TF_RETURN_IF_ERROR(
+        instruction->fused_instructions_computation()->Accept(this));
     TF_RETURN_IF_ERROR(
         PopulateDefinedBuffersAndAliases(instruction->fused_instructions()));
   }

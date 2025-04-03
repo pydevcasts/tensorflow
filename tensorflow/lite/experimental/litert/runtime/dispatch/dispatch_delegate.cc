@@ -20,18 +20,22 @@
 
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
-#include "absl/types/span.h"
 #include "tensorflow/lite/c/c_api_opaque.h"
 #include "tensorflow/lite/c/c_api_types.h"
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/delegates/utils/simple_opaque_delegate.h"
 #include "tensorflow/lite/experimental/litert/c/litert_dispatch_delegate.h"
+#include "tensorflow/lite/experimental/litert/c/litert_environment_options.h"
 #include "tensorflow/lite/experimental/litert/c/litert_logging.h"
+#include "tensorflow/lite/experimental/litert/cc/litert_dispatch_delegate.h"
+#include "tensorflow/lite/experimental/litert/core/build_stamp.h"
 #include "tensorflow/lite/experimental/litert/runtime/dispatch/dispatch_delegate_kernel.h"
 #include "tensorflow/lite/experimental/litert/runtime/dispatch/dispatch_delegate_options.h"
 #include "tensorflow/lite/experimental/litert/vendors/c/litert_dispatch.h"
 
 namespace {
+
+using ::litert::internal::kLiteRtDispatchOpCustomCode;
 
 // A TFL Delegate that can recognize subgraphs that run on Dispatch API capable
 // accelerators, e.g. TPU, DSP, ... It replaces such subgraphs and offloads
@@ -66,7 +70,6 @@ class DispatchDelegate : public tflite::SimpleOpaqueDelegateInterface {
 
  private:
   static constexpr absl::string_view kDelegateName = "DispatchDelegate";
-  static constexpr absl::string_view kDispatchNodeCustomCode = "dispatch_node";
 
   explicit DispatchDelegate(litert::DispatchDelegateOptionsPtr&& options)
       : options_(std::move(options)) {}
@@ -79,7 +82,7 @@ bool DispatchDelegate::IsNodeSupportedByDelegate(
     const TfLiteOperator* op, const TfLiteOpaqueNode* node,
     TfLiteOpaqueContext* context) const {
   auto custom_code = absl::string_view(TfLiteOperatorGetCustomName(op));
-  return custom_code == kDispatchNodeCustomCode;
+  return custom_code == kLiteRtDispatchOpCustomCode;
 }
 
 TfLiteStatus DispatchDelegate::Initialize(TfLiteOpaqueContext* context) {
@@ -95,19 +98,20 @@ DispatchDelegate::CreateDelegateKernelInterface() {
 
   auto kernel = litert::internal::DispatchDelegateKernel::Create(
       std::move(dispatch_graph_name), *options_);
-  if (kernel.ok()) {
+  if (kernel) {
     return std::move(*kernel);
   } else {
-    LITERT_LOG(LITERT_ERROR, "Failed to create a dispatch delegate kernel: %s",
-               kernel.status().message().data());
+    LITERT_FATAL("Failed to create a dispatch delegate kernel: %s",
+                 kernel.Error().Message().c_str());
     return nullptr;
   }
 }
 
 }  // namespace
 
-LiteRtDispatchDelegateOptions* LiteRtCreateDefaultDispatchDelegateOptions() {
-  return new LiteRtDispatchDelegateOptions;
+LiteRtDispatchDelegateOptions* LiteRtCreateDefaultDispatchDelegateOptions(
+    LiteRtEnvironmentOptions environment_options) {
+  return new LiteRtDispatchDelegateOptions(environment_options);
 }
 
 TfLiteStatus LiteRtAddDispatchDelegateOption(
@@ -121,23 +125,15 @@ TfLiteStatus LiteRtAddDispatchDelegateOption(
   return kTfLiteOk;
 }
 
-TfLiteStatus LiteRtAddDispatchDelegateExecInfoOption(
-    LiteRtDispatchDelegateOptions* options, const char* exec_tag,
-    const void* bytecode_addr, size_t bytecode_size,
-    const char* function_name) {
-  if (!options || !exec_tag || !bytecode_addr) {
-    LITERT_LOG(LITERT_ERROR, "Null input");
-    return kTfLiteError;
-  }
+TfLiteStatus LiteRtDispatchDelegateAddAllocBaseOption(
+    LiteRtDispatchDelegateOptions* options, const void* alloc_base) {
+  AddAllocBaseOption(alloc_base, *options);
+  return kTfLiteOk;
+}
 
-  LiteRtDispatchDelegateOptions::ExecInfo exec_info;
-  exec_info.bytecode =
-      absl::MakeSpan(static_cast<const uint8_t*>(bytecode_addr), bytecode_size);
-  if (function_name) {
-    exec_info.function_name = function_name;
-  }
-
-  options->AddExecInfo(exec_tag, std::move(exec_info));
+TfLiteStatus LiteRtDispatchDelegateAddAllocFdOption(
+    LiteRtDispatchDelegateOptions* options, int alloc_fd) {
+  AddAllocFdOption(alloc_fd, *options);
   return kTfLiteOk;
 }
 
@@ -146,8 +142,12 @@ void LiteRtDestroyDispatchDelegateOptions(
   delete options;
 }
 
-TfLiteDelegate* LiteRtCreateDispatchDelegate(
+TfLiteOpaqueDelegate* LiteRtCreateDispatchDelegate(
+    LiteRtEnvironmentOptions environment_options,
     LiteRtDispatchDelegateOptions* options) {
+  if (!options) {
+    options = LiteRtCreateDefaultDispatchDelegateOptions(environment_options);
+  }
   return DispatchDelegate::Create(options);
 }
 
@@ -157,14 +157,17 @@ void LiteRtDestroyDispatchDelegate(TfLiteOpaqueDelegate* delegate) {
 
 namespace litert {
 
-DispatchDelegateOptionsPtr CreateDispatchDelegateOptionsPtr() {
-  return {LiteRtCreateDefaultDispatchDelegateOptions(),
+DispatchDelegateOptionsPtr CreateDispatchDelegateOptionsPtr(
+    LiteRtEnvironmentOptions environment_options) {
+  return {LiteRtCreateDefaultDispatchDelegateOptions(environment_options),
           LiteRtDestroyDispatchDelegateOptions};
 }
 
 DispatchDelegatePtr CreateDispatchDelegatePtr(
+    LiteRtEnvironmentOptions environment_options,
     DispatchDelegateOptionsPtr&& options) {
-  return DispatchDelegatePtr(LiteRtCreateDispatchDelegate(options.release()),
-                             LiteRtDestroyDispatchDelegate);
+  return DispatchDelegatePtr(
+      LiteRtCreateDispatchDelegate(environment_options, options.release()),
+      LiteRtDestroyDispatchDelegate);
 }
 }  // namespace litert

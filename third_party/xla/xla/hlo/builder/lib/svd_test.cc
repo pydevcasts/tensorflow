@@ -15,8 +15,8 @@ limitations under the License.
 
 #include "xla/hlo/builder/lib/svd.h"
 
+#include <cstdint>
 #include <numeric>
-#include <utility>
 #include <vector>
 
 #include "absl/status/statusor.h"
@@ -84,7 +84,7 @@ class SVDTest : public ClientLibraryTestBase {
       v = SliceInMinorDims(v, {0, 0}, {n, m});
     }
 
-    int num_dims = u_shape.rank();
+    int num_dims = u_shape.dimensions_size();
     std::vector<int64_t> broadcast_dims(num_dims - 1);
     std::iota(broadcast_dims.begin(), broadcast_dims.end(), 0);
     broadcast_dims[num_dims - 2] = num_dims - 1;

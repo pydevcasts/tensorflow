@@ -101,7 +101,7 @@ else()
   set(FLATC_TARGET "flatbuffers-flatc")
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(_TFLITE_ENABLE_RUY "${TFLITE_ENABLE_RUY}")
 if("${CMAKE_SYSTEM_NAME}" STREQUAL "Android")
@@ -396,6 +396,7 @@ if(TFLITE_ENABLE_GPU)
     ${TFLITE_DELEGATES_GPU_COMMON_TRANSFORMATIONS_SRCS}
     ${TFLITE_SOURCE_DIR}/tools/versioning/gpu_compatibility.cc
     ${TFLITE_SOURCE_DIR}/tools/versioning/op_signature.cc
+    ${TF_SOURCE_DIR}/compiler/mlir/lite/tools/versioning/op_signature.cc
   )
   include_directories(
     AFTER
@@ -598,7 +599,7 @@ if(_TFLITE_ENABLE_RUY)
 endif()
 populate_tflite_source_vars("kernels"
   TFLITE_KERNEL_SRCS
-  FILTER "(.*_test_util_internal|test_.*|.*_ops_wrapper)\\.(cc|h)"
+  FILTER "([^/]*_test_util_internal|test_[^/]*|[^/]*_ops_wrapper)\\.(cc|h)$"
 )
 populate_tflite_source_vars("kernels/internal" TFLITE_KERNEL_INTERNAL_SRCS)
 populate_tflite_source_vars("kernels/internal/optimized"
@@ -621,7 +622,7 @@ populate_tflite_source_vars("kernels/internal/reference/sparse_ops"
 )
 populate_tflite_source_vars("kernels/internal/optimized/4bit"
   TFLITE_KERNEL_INTERNAL_OPT_4BIT_SRCS
-  FILTER "(.*neon.*|.*sse.*)\\.(cc|h)"
+  FILTER "(.*neon_.*|.*sse_.*)\\.(cc|h)"
 )
 set(TFLITE_PROFILER_SRCS
   ${TFLITE_SOURCE_DIR}/profiling/platform_profiler.cc
@@ -692,6 +693,7 @@ set(_ALL_TFLITE_SRCS
   ${TF_SOURCE_DIR}/compiler/mlir/lite/allocation.h
   ${TF_SOURCE_DIR}/compiler/mlir/lite/core/api/error_reporter.cc
   ${TF_SOURCE_DIR}/compiler/mlir/lite/core/api/error_reporter.h
+  ${TF_SOURCE_DIR}/compiler/mlir/lite/core/api/flatbuffer_conversions.cc
   ${TF_SOURCE_DIR}/compiler/mlir/lite/core/api/verifier.h
   ${TF_SOURCE_DIR}/compiler/mlir/lite/core/c/tflite_types.h
   ${TF_SOURCE_DIR}/compiler/mlir/lite/core/macros.h

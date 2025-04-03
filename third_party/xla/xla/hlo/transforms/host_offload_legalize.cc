@@ -18,8 +18,8 @@ limitations under the License.
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <queue>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -38,7 +38,8 @@ limitations under the License.
 #include "xla/layout.h"
 #include "xla/service/call_graph.h"
 #include "xla/service/hlo_value.h"
-#include "xla/service/host_memory_offload_annotations.h"
+#include "xla/service/host_offload_utils.h"
+#include "xla/service/memory_annotations.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/util.h"
@@ -59,8 +60,8 @@ constexpr std::array<HloOpcode, 2> kUsersOpcodes = {HloOpcode::kSlice,
 
 // Find an annotation moving up. Meant to find an annotation from a DUS operand.
 HloInstruction* FindToHostAnnotationToUpdate(HloInstruction* instr) {
-  while (!instr->IsCustomCall(
-      host_memory_offload_annotations::kMoveToHostCustomCallTarget)) {
+  while (
+      !instr->IsCustomCall(memory_annotations::kMoveToHostCustomCallTarget)) {
     if ((instr->opcode() != HloOpcode::kBitcast &&
          instr->opcode() != HloOpcode::kCopy &&
          instr->opcode() != HloOpcode::kReshape) ||
@@ -75,8 +76,8 @@ HloInstruction* FindToHostAnnotationToUpdate(HloInstruction* instr) {
 // Find an annotation moving up. Meant to find an annotation from a DUS
 // instruction.
 HloInstruction* FindToDeviceAnnotationToUpdate(HloInstruction* instr) {
-  while (!instr->IsCustomCall(
-      host_memory_offload_annotations::kMoveToDeviceCustomCallTarget)) {
+  while (
+      !instr->IsCustomCall(memory_annotations::kMoveToDeviceCustomCallTarget)) {
     if (instr->user_count() != 1 ||
         (instr->opcode() != HloOpcode::kBitcast &&
          instr->opcode() != HloOpcode::kReshape &&
@@ -166,6 +167,7 @@ struct InstructionAndIndex {
 // Walk up in the chain of memory offloaded instructions. absl::Status not-ok
 // when an instructions not supported or end of chain reached. Walks one
 // instruction at a time.
+// Returns current_value if there is nowhere else to go.
 absl::StatusOr<InstructionAndIndex> WalkUpMemoryOffload(
     InstructionAndIndex current_value, const CallGraph& call_graph) {
   // TODO(maggioni): Verify that set of instructions supported in chain by
@@ -196,8 +198,11 @@ absl::StatusOr<InstructionAndIndex> WalkUpMemoryOffload(
       return InstructionAndIndex(root, index);
     }
     case HloOpcode::kParameter: {
-      CHECK_NE(instruction->parent(),
-               instruction->GetModule()->entry_computation());
+      if (instruction->parent() ==
+          instruction->GetModule()->entry_computation()) {
+        // We reached the top. No further to go.
+        return current_value;
+      }
       std::vector<HloInstruction*> callers =
           call_graph.GetComputationCallers(instruction->parent());
       if (callers.size() != 1) {
@@ -217,7 +222,7 @@ absl::StatusOr<InstructionAndIndex> WalkUpMemoryOffload(
     case HloOpcode::kCustomCall: {
       if (!instruction->IsCustomCall("AllocateBuffer") &&
           !instruction->IsCustomCall(
-              host_memory_offload_annotations::kMoveToHostCustomCallTarget)) {
+              memory_annotations::kMoveToHostCustomCallTarget)) {
         return absl::InvalidArgumentError(
             "Expected AllocateBuffer or MoveToHost custom-call");
       }
@@ -334,8 +339,8 @@ absl::StatusOr<std::vector<InstructionAndIndex>> WalkDownMemoryOffload(
         break;
       }
       case HloOpcode::kCustomCall: {
-        if (user->IsCustomCall(host_memory_offload_annotations::
-                                   kMoveToDeviceCustomCallTarget)) {
+        if (user->IsCustomCall(
+                memory_annotations::kMoveToDeviceCustomCallTarget)) {
           results.emplace_back(user, current_value.index);
           break;
         }
@@ -414,7 +419,16 @@ Shape RemoveMajormostDimension(const Shape& shape) {
   return ShapeUtil::DeleteDimension(majormost_dim, shape);
 }
 
-absl::Status MoveCopy(
+Shape AddMajormostDimension(const Shape& shape) {
+  CHECK(shape.has_layout()) << "Shape must have layout.";
+  Shape new_shape = ShapeUtil::PrependMajorDimension(1, shape);
+  for (const Tile& tile : shape.layout().tiles()) {
+    *new_shape.mutable_layout()->add_tiles() = tile;
+  }
+  return new_shape;
+}
+
+absl::Status MoveCopyDown(
     const InstructionAndIndex& copy_to_move_instruction_and_index,
     const CallGraph* call_graph,
     absl::flat_hash_set<HloInstruction*>& processed_annotations,
@@ -462,7 +476,7 @@ absl::Status MoveCopy(
       if (instruction->opcode() == HloOpcode::kBitcast) {
         // For now, we only know how to move a copy over a bitcast which
         // "reshapes" away the majormost dimension (which must be a degenerate
-        // dimension).
+        // dimension), or reshapes to add a degenerate majormost dimension.
         const Shape& before_bitcast_shape = instruction->operand(0)->shape();
         const Shape& after_bitcast_shape = instruction->shape();
         if (!Shape::Equal().IgnoreLayout()(copy_to_move->operand(0)->shape(),
@@ -471,32 +485,59 @@ absl::Status MoveCopy(
               "Expecting copy to only change instructions layout. Copy: %s",
               copy_to_move->ToString()));
         }
-        if (after_bitcast_shape.rank() != before_bitcast_shape.rank() - 1) {
+        if (after_bitcast_shape.dimensions_size() ==
+            before_bitcast_shape.dimensions_size() - 1) {
+          if (!(ShapeUtil::IsEffectivelyMostMajorDimension(before_bitcast_shape,
+                                                           0) &&
+                before_bitcast_shape.dimensions(0) == 1)) {
+            return absl::InternalError(absl::StrFormat(
+                "Only handling bitcasts with majormost dimension "
+                "of size 1. This bitcast is \"%s\"",
+                instruction->ToString()));
+          }
+          const Shape new_bitcast_shape =
+              RemoveMajormostDimension(shape_before_copy);
+          VLOG(2) << absl::StreamFormat(
+              " Encountered bitcast \"%s\", updating current shape from %s to "
+              "%s",
+              instruction->name(), shape_before_copy.ToString(true),
+              new_bitcast_shape.ToString(true));
+          shape_before_copy = new_bitcast_shape;
+          const Shape new_copy_shape =
+              RemoveMajormostDimension(shape_after_copy);
+          VLOG(2) << absl::StreamFormat(
+              " Also updating shape after copy from %s to %s",
+              shape_after_copy.ToString(true), new_copy_shape.ToString(true));
+          shape_after_copy = new_copy_shape;
+        } else if (after_bitcast_shape.dimensions_size() ==
+                   before_bitcast_shape.dimensions_size() + 1) {
+          if (!(ShapeUtil::IsEffectivelyMostMajorDimension(after_bitcast_shape,
+                                                           0) &&
+                after_bitcast_shape.dimensions(0) == 1)) {
+            return absl::InternalError(absl::StrFormat(
+                "Only handling bitcasts with majormost dimension "
+                "of size 1. This bitcast is \"%s\"",
+                instruction->ToString()));
+          }
+          const Shape new_bitcast_shape =
+              AddMajormostDimension(shape_before_copy);
+          VLOG(2) << absl::StreamFormat(
+              " Encountered bitcast \"%s\", updating current shape from %s to "
+              "%s",
+              instruction->name(), shape_before_copy.ToString(true),
+              new_bitcast_shape.ToString(true));
+          shape_before_copy = new_bitcast_shape;
+          const Shape new_copy_shape = AddMajormostDimension(shape_after_copy);
+          VLOG(2) << absl::StreamFormat(
+              " Also updating shape after copy from %s to %s",
+              shape_after_copy.ToString(true), new_copy_shape.ToString(true));
+          shape_after_copy = new_copy_shape;
+        } else {
           return absl::InternalError(
-              absl::StrFormat("Only handling bitcasts which remove 0'th "
-                              "dimension. This bitcast is \"%s\"",
+              absl::StrFormat("Only handling bitcasts which add or remove a "
+                              "0'th dimension. This bitcast is \"%s\"",
                               instruction->ToString()));
         }
-        if (!(ShapeUtil::IsEffectivelyMostMajorDimension(before_bitcast_shape,
-                                                         0) &&
-              before_bitcast_shape.dimensions(0) == 1)) {
-          return absl::InternalError(
-              absl::StrFormat("Only handling bitcasts with majormost dimension "
-                              "of size 1. This bitcast is \"%s\"",
-                              instruction->ToString()));
-        }
-        const Shape new_bitcast_shape =
-            RemoveMajormostDimension(shape_before_copy);
-        VLOG(2) << absl::StreamFormat(
-            " Encountered bitcast \"%s\", updating current shape from %s to %s",
-            instruction->name(), shape_before_copy.ToString(true),
-            new_bitcast_shape.ToString(true));
-        shape_before_copy = new_bitcast_shape;
-        const Shape new_copy_shape = RemoveMajormostDimension(shape_after_copy);
-        VLOG(2) << absl::StreamFormat(
-            " Also updating shape after copy from %s to %s",
-            shape_after_copy.ToString(true), new_copy_shape.ToString(true));
-        shape_after_copy = new_copy_shape;
       } else if (instruction->opcode() == HloOpcode::kSlice ||
                  instruction->opcode() == HloOpcode::kDynamicSlice) {
         // Since we're moving the copy over a Slice/DynamicSlice, we need to
@@ -534,7 +575,7 @@ absl::Status MoveCopy(
              "happens";
       if (absl::c_linear_search(kUsersOpcodes, instruction->opcode()) ||
           instruction->IsCustomCall(
-              host_memory_offload_annotations::kMoveToDeviceCustomCallTarget)) {
+              memory_annotations::kMoveToDeviceCustomCallTarget)) {
         HloInstruction* annotation =
             FindToDeviceAnnotationToUpdate(instruction);
         CHECK_NE(annotation, nullptr)
@@ -599,7 +640,7 @@ absl::Status MoveCopy(
             instruction->operand(1)->shape().layout().minor_to_major()) {
           HloInstruction* update_slice = instruction->mutable_operand(1);
           CHECK(update_slice->IsCustomCall(
-              host_memory_offload_annotations::kMoveToHostCustomCallTarget));
+              memory_annotations::kMoveToHostCustomCallTarget));
           *update_slice->mutable_shape()->mutable_layout() =
               instruction->shape().layout();
           HloInstruction* new_copy =
@@ -619,6 +660,40 @@ absl::Status MoveCopy(
       copy_to_move->mutable_operand(0)));
   TF_RETURN_IF_ERROR(copy_to_move->parent()->RemoveInstruction(copy_to_move));
   return absl::OkStatus();
+}
+
+// Returns true if the copy should be moved. A copy can be moved if there is
+// always a place for it after being moved back to device.
+bool ShouldMoveCopyDown(InstructionAndIndex copy_to_move) {
+  std::queue<host_offload_utils::InstructionAndShapeIndex> queue;
+  queue.push({copy_to_move.instruction, {}});
+  while (!queue.empty()) {
+    host_offload_utils::InstructionAndShapeIndex current = queue.front();
+    queue.pop();
+    if (current.instruction->IsRoot() &&
+        current.instruction->parent()->IsEntryComputation()) {
+      // It reaches entry computation root without being brought back to the
+      // device. Do not move this copy since there is no place to do this copy
+      // on device.
+      return false;
+    }
+
+    // Push successors onto the queue to be visited.
+    absl::StatusOr<std::vector<host_offload_utils::InstructionAndShapeIndex>>
+        successors = host_offload_utils::GetSuccessors(current);
+    if (!successors.ok()) {
+      return false;
+    }
+    for (const host_offload_utils::InstructionAndShapeIndex& successor :
+         successors.value()) {
+      if (successor.instruction->IsCustomCall(
+              memory_annotations::kMoveToDeviceCustomCallTarget)) {
+        continue;
+      }
+      queue.push(successor);
+    }
+  }
+  return true;
 }
 
 absl::StatusOr<bool> ProcessAnnotationForCopyMovement(
@@ -641,7 +716,7 @@ absl::StatusOr<bool> ProcessAnnotationForCopyMovement(
     starting_instr = instruction;
   }
   if (!(starting_instr->IsCustomCall(
-            host_memory_offload_annotations::kMoveToHostCustomCallTarget) ||
+            memory_annotations::kMoveToHostCustomCallTarget) ||
         IsEntryComputationParameter(starting_instr) ||
         starting_instr->opcode() == HloOpcode::kDynamicUpdateSlice)) {
     return absl::InternalError(
@@ -681,7 +756,7 @@ absl::StatusOr<bool> ProcessAnnotationForCopyMovement(
         // Check if this dynamic-update-slice doesn't have an annotation
         // attached.
         if (!real_annotation->IsCustomCall(
-                host_memory_offload_annotations::kMoveToHostCustomCallTarget)) {
+                memory_annotations::kMoveToHostCustomCallTarget)) {
           return false;
         }
       }
@@ -699,19 +774,19 @@ absl::StatusOr<bool> ProcessAnnotationForCopyMovement(
     if (absl::c_linear_search(kUsersOpcodes,
                               stack.back().instruction->opcode()) ||
         stack.back().instruction->IsCustomCall(
-            host_memory_offload_annotations::kMoveToDeviceCustomCallTarget)) {
+            memory_annotations::kMoveToDeviceCustomCallTarget)) {
       HloInstruction* annotation =
           FindToDeviceAnnotationToUpdate(stack.back().instruction);
       if (!annotation ||
           !annotation->IsCustomCall(
-              host_memory_offload_annotations::kMoveToDeviceCustomCallTarget)) {
+              memory_annotations::kMoveToDeviceCustomCallTarget)) {
         VLOG(5) << "Couldn't find annotation for consumer instruction in chain";
         return false;
       }
 
       // Fix up while body's root instruction shape along the way.
       if (annotation->IsCustomCall(
-              host_memory_offload_annotations::kMoveToDeviceCustomCallTarget)) {
+              memory_annotations::kMoveToDeviceCustomCallTarget)) {
         for (HloInstruction* user : annotation->users()) {
           HloInstruction* root_instruction =
               annotation->parent()->root_instruction();
@@ -781,13 +856,36 @@ absl::StatusOr<bool> ProcessAnnotationForCopyMovement(
     return false;
   }
 
+  bool changed = false;
   // Process all copies one at a time from the last to the first and push it to
   // its specific user.
   for (auto it = copies_to_move.rbegin(); it != copies_to_move.rend(); ++it) {
-    TF_RETURN_IF_ERROR(
-        MoveCopy(*it, call_graph, processed_annotations, to_remove));
+    InstructionAndIndex& copy_to_move_and_index = *it;
+    HloInstruction* copy_to_move = copy_to_move_and_index.instruction;
+    if (ShouldMoveCopyDown(copy_to_move_and_index)) {
+      TF_RETURN_IF_ERROR(MoveCopyDown(copy_to_move_and_index, call_graph,
+                                      processed_annotations, to_remove));
+      changed = true;
+    } else {
+      // We should not move this copy down; maybe we can move it up. For now, we
+      // only check if we can easily move it up by swapping places with its
+      // operand.
+      if (copy_to_move->operand(0)->IsCustomCall(
+              memory_annotations::kMoveToHostCustomCallTarget)) {
+        HloInstruction* custom_call = copy_to_move->mutable_operand(0);
+        TF_RETURN_IF_ERROR(copy_to_move->ReplaceAllUsesWith(custom_call));
+        TF_RETURN_IF_ERROR(copy_to_move->ReplaceOperandWith(
+            0, custom_call->mutable_operand(0)));
+        TF_RETURN_IF_ERROR(custom_call->ReplaceOperandWith(0, copy_to_move));
+        copy_to_move->mutable_shape()->mutable_layout()->set_memory_space(
+            Layout::kDefaultMemorySpace);
+        *custom_call->mutable_shape()->mutable_layout() =
+            copy_to_move->shape().layout();
+        changed = true;
+      }
+    }
   }
-  return true;
+  return changed;
 }
 
 // Fixes layout changing copies in between on the path to users.
@@ -838,7 +936,7 @@ HostOffloadLegalize::FindStartingInstructionsOfHostMemoryOffload(
       }
 
       if (instruction->IsCustomCall(
-              host_memory_offload_annotations::kMoveToHostCustomCallTarget)) {
+              memory_annotations::kMoveToHostCustomCallTarget)) {
         starting_instructions.push_back(instruction);
       }
     }

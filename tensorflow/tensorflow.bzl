@@ -25,6 +25,7 @@ load(
     "if_mkldnn_openmp",
     "onednn_v3_define",
 )
+load("//tensorflow:tf_version.bzl", "TF_VERSION")
 
 #
 # Returns the options to use for a C++ library or binary build.
@@ -81,7 +82,7 @@ load(
     "if_tensorrt_exec",
 )
 load(
-    "@local_tsl//third_party/py/rules_pywrap:pywrap.bzl",
+    "@local_xla//third_party/py/rules_pywrap:pywrap.default.bzl",
     "use_pywrap_rules",
     _pybind_extension = "pybind_extension",
     _stripped_cc_info = "stripped_cc_info",
@@ -93,10 +94,7 @@ def register_extension_info(**kwargs):
 
 # version for the shared libraries, can
 # not contain rc or alpha, only numbers.
-# Also update tensorflow/core/public/version.h
-# and tensorflow/tools/pip_package/setup.py
-WHEEL_VERSION = "2.19.0"
-VERSION = "2.19.0"
+VERSION = TF_VERSION
 VERSION_MAJOR = VERSION.split(".")[0]
 two_gpu_tags = ["requires-gpu-nvidia:2", "manual", "no_pip"]
 
@@ -357,6 +355,7 @@ def if_libtpu(if_true, if_false = []):
     return select({
         # copybara:uncomment_begin(different config setting in OSS)
         # "//tools/cc_target_os:gce": if_true,
+        # "//buildenv/platforms/settings:chrome_linux": if_false,
         # copybara:uncomment_end_and_comment_begin
         clean_dep("//tensorflow:with_tpu_support"): if_true,
         # copybara:comment_end
@@ -918,6 +917,13 @@ def tf_cc_shared_library_opensource(
     """Configures the shared object file for TensorFlow."""
 
     if use_pywrap_rules():
+        # TODO(b/356020232): move to a simple top-level target once this macro is removed.
+        # This target is used solely for filtering purposes and not put directly into
+        # any final binary artifacts.
+        cc_library(
+            name = "%s_pywrap_filter" % name,
+            deps = roots,
+        )
         return
 
     names = _get_shared_library_name_os_version_matrix(
@@ -1376,6 +1382,7 @@ def _generate_op_reg_offsets_impl(ctx):
         tools = [ctx.executable._offset_counter],
         executable = ctx.executable._offset_counter,
         arguments = [args],
+        use_default_shell_env = True,
     )
 
 generate_op_reg_offsets = rule(
@@ -2214,7 +2221,6 @@ def tf_custom_op_library_additional_deps_impl():
     return [
         # copybara:comment_begin
         "@com_google_protobuf//:protobuf",
-        "@nsync//:nsync_cpp",
         # copybara:comment_end
 
         # for //third_party/eigen3
@@ -2315,7 +2321,7 @@ def tf_custom_op_library(
         gpu_deps = []
 
     if use_pywrap_rules():
-        deps = [clean_dep("//tensorflow/python:_pywrap_tensorflow_common")] + deps
+        deps = [clean_dep("//tensorflow/python:tensorflow_common_framework")] + deps
     else:
         deps = list(deps)
 
@@ -2622,20 +2628,17 @@ def py_test(
         exec_properties = None,
         test_rule = _plain_py_test,
         env = {},
+        extra_pywrap_deps = [clean_dep("//tensorflow/python:_pywrap_tensorflow")],
         **kwargs):
     if not exec_properties:
         exec_properties = tf_exec_properties(kwargs)
 
     if use_pywrap_rules():
-        test_env = {
-            "PYWRAP_TARGET": clean_dep(Label("//tensorflow/python:_pywrap_tensorflow")),
-        }
-        test_env.update(env)
         actual_deps = deps.to_list() if hasattr(deps, "to_list") else deps
         test_rule(
-            deps = actual_deps + [test_env["PYWRAP_TARGET"]],
+            deps = actual_deps + extra_pywrap_deps,
             exec_properties = exec_properties,
-            env = test_env,
+            env = env,
             data = data,
             **kwargs
         )
@@ -2981,18 +2984,17 @@ def tf_genrule_cmd_append_to_srcs(to_append):
             " >> $(@)")
 
 def _local_exec_transition_impl(settings, attr):
+    modify_execution_info = settings["//command_line_option:modify_execution_info"]
     return {
         # Force all targets in the subgraph to build on the local machine.
-        "//command_line_option:modify_execution_info": ".*=+no-remote-exec",
+        "//command_line_option:modify_execution_info": modify_execution_info + [".*=+no-remote-exec"],
     }
 
 # A transition that forces all targets in the subgraph to be built locally.
 _local_exec_transition = transition(
     implementation = _local_exec_transition_impl,
-    inputs = [],
-    outputs = [
-        "//command_line_option:modify_execution_info",
-    ],
+    inputs = ["//command_line_option:modify_execution_info"],
+    outputs = ["//command_line_option:modify_execution_info"],
 )
 
 def _local_genrule_impl(ctx):
@@ -3143,9 +3145,10 @@ def pybind_extension_opensource(
         srcs_version = "PY3",
         testonly = None,
         visibility = None,
-        win_def_file = None):
+        win_def_file = None,
+        starlark_only = False):
     """Builds a generic Python extension module."""
-    _ignore = [enable_stub_generation, additional_stubgen_deps, module_name]  # buildifier: disable=unused-variable
+    _ignore = [enable_stub_generation, additional_stubgen_deps, module_name, starlark_only]  # buildifier: disable=unused-variable
     p = name.rfind("/")
     if p == -1:
         sname = name
@@ -3218,7 +3221,6 @@ def pybind_extension_opensource(
             compatible_with = compatible_with,
             deprecation = deprecation,
             features = features + ["-use_header_modules"],
-            licenses = licenses,
             restricted_to = restricted_to,
             shared_lib_name = so_file,
             testonly = testonly,
@@ -3328,7 +3330,23 @@ def pybind_extension_opensource(
     )
 
 # Export open source version of pybind_extension under base name as well.
-pybind_extension = _pybind_extension if use_pywrap_rules() else pybind_extension_opensource
+def pybind_extension(
+        name,
+        common_lib_packages = [],
+        pywrap_only = False,
+        **kwargs):
+    if use_pywrap_rules():
+        _pybind_extension(
+            name = name,
+            common_lib_packages = common_lib_packages + ["tensorflow", "tensorflow/python"],
+            **kwargs
+        )
+    elif not pywrap_only:
+        pybind_extension_opensource(
+            name = name,
+            **kwargs
+        )
+
 stripped_cc_info = _stripped_cc_info
 
 # Note: we cannot add //third_party/tf_runtime:__subpackages__ here,
@@ -3374,7 +3392,6 @@ def tf_python_pybind_static_deps(testonly = False):
         "@cpuinfo//:__subpackages__",
         "@curl//:__subpackages__",
         "@dlpack//:__subpackages__",
-        "@double_conversion//:__subpackages__",
         "@eigen_archive//:__subpackages__",
         "@farmhash_archive//:__subpackages__",
         "@farmhash_gpu_archive//:__subpackages__",
@@ -3399,7 +3416,6 @@ def tf_python_pybind_static_deps(testonly = False):
         "@local_config_tensorrt//:__subpackages__",
         "@local_execution_config_platform//:__subpackages__",
         "@mkl_dnn_acl_compatible//:__subpackages__",
-        "@nsync//:__subpackages__",
         "@nccl_archive//:__subpackages__",
         "@onednn//:__subpackages__",
         "@org_sqlite//:__subpackages__",
@@ -3444,7 +3460,9 @@ def tf_python_pybind_extension_opensource(
         testonly = False,
         visibility = None,
         win_def_file = None,
-        additional_exported_symbols = None):
+        additional_exported_symbols = None,
+        linkopts = [],
+        starlark_only = False):
     """A wrapper macro for pybind_extension_opensource that is used in tensorflow/python/BUILD.
 
     Please do not use it anywhere else as it may behave unexpectedly. b/146445820
@@ -3473,10 +3491,12 @@ def tf_python_pybind_extension_opensource(
         testonly = testonly,
         visibility = visibility,
         win_def_file = win_def_file,
+        linkopts = linkopts,
+        starlark_only = starlark_only,
     )
 
 # Export open source version of tf_python_pybind_extension under base name as well.
-tf_python_pybind_extension = _pybind_extension if use_pywrap_rules() else tf_python_pybind_extension_opensource
+tf_python_pybind_extension = pybind_extension if use_pywrap_rules() else tf_python_pybind_extension_opensource
 
 def tf_pybind_cc_library_wrapper_opensource(name, deps, visibility = None, **kwargs):
     """Wrapper for cc_library and proto dependencies used by tf_python_pybind_extension_opensource.
@@ -3549,6 +3569,9 @@ def tfcompile_dfsan_enabled():
 
 def tfcompile_dfsan_abilists():
     return []
+
+def tfcompile_friends():
+    return ["public"]
 
 def tf_external_workspace_visible(visibility):
     # External workspaces can see this target.
@@ -3686,7 +3709,7 @@ def if_cuda_tools(if_true, if_false = []):
 # The config is used to determine if we need dependency on pre-built wheels.
 def if_wheel_dependency(if_true, if_false = []):
     return select({
-        "@local_tsl//third_party/py:enable_wheel_dependency": if_true,
+        "@local_xla//third_party/py:enable_wheel_dependency": if_true,
         "//conditions:default": if_false,
     })
 

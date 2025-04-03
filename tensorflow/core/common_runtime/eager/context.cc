@@ -46,6 +46,7 @@ limitations under the License.
 
 #include "tensorflow/c/tf_tensor.h"
 #include "tensorflow/c/tf_tensor_internal.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/util/env_var.h"
 #include "tensorflow/core/common_runtime/collective_executor_mgr.h"
 #include "tensorflow/core/common_runtime/collective_param_resolver_local.h"
@@ -63,7 +64,6 @@ limitations under the License.
 #include "tensorflow/core/public/version.h"
 #include "tensorflow/core/util/device_name_utils.h"
 #include "tsl/platform/refcount.h"
-#include "tsl/platform/statusor.h"
 #if !defined(IS_MOBILE_PLATFORM)
 #include "tensorflow/core/distributed_runtime/cluster_function_library_runtime.h"
 #include "tensorflow/core/distributed_runtime/collective_param_resolver_distributed.h"
@@ -93,7 +93,7 @@ EagerContext* GetCEagerContext() { return global_c_eager_context; }
 
 namespace {
 
-bool ReadBoolFromEnvVar(StringPiece env_var_name, bool default_val) {
+bool ReadBoolFromEnvVar(absl::string_view env_var_name, bool default_val) {
   bool val;
   if (tensorflow::ReadBoolFromEnvVar(env_var_name, default_val, &val).ok()) {
     return val;
@@ -168,8 +168,8 @@ EagerContext::EagerContext(
             &func_lib_def_, opts.config.graph_options().optimizer_options(),
             thread_pool_.get(), cluster_flr);
   // Starts exporting metrics through a platform-specific monitoring API (if
-  // provided). For builds using "tensorflow/tsl/platform/default", this is
-  // currently a no-op.
+  // provided). For builds using "tensorflow/compiler/xla/tsl/platform/default",
+  // this is currently a no-op.
   eager_context_created->GetCell()->Set(true);
   InitPrioritizedDeviceTypeList();
   runner_ = [this](std::function<void()> closure) {
@@ -1297,7 +1297,7 @@ absl::Status EagerContext::FindDeviceFromName(const char* device_name,
 }
 
 absl::Status EagerContext::FindCompositeDeviceFromName(
-    StringPiece device_name, CompositeDevice** device) const {
+    absl::string_view device_name, CompositeDevice** device) const {
   tf_shared_lock l(composite_devices_mu_);
   for (const auto& d : composite_devices_) {
     if (d.second->name() == device_name) {

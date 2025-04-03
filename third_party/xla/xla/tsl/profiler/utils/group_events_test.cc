@@ -15,17 +15,19 @@ limitations under the License.
 
 #include "xla/tsl/profiler/utils/group_events.h"
 
+#include <cstdint>
 #include <optional>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "xla/tsl/platform/test.h"
+#include "xla/tsl/platform/types.h"
 #include "xla/tsl/profiler/utils/tf_xplane_visitor.h"
 #include "xla/tsl/profiler/utils/xplane_builder.h"
 #include "xla/tsl/profiler/utils/xplane_schema.h"
 #include "xla/tsl/profiler/utils/xplane_test_utils.h"
 #include "xla/tsl/profiler/utils/xplane_visitor.h"
-#include "tsl/platform/test.h"
-#include "tsl/platform/types.h"
 #include "tsl/profiler/protobuf/xplane.pb.h"
 
 namespace tsl {
@@ -136,6 +138,7 @@ TEST(GroupEventsTest, GroupTensorFlowLoopTest) {
   constexpr int64_t kStepId = 0;
   constexpr int64_t kIterNum = 10;
   constexpr int64_t kCorrelationId = 100;
+  constexpr int64_t kRawValue = 10;
 
   XSpace space;
   XPlaneBuilder host_plane_builder(GetOrCreateHostXPlane(&space));
@@ -165,11 +168,20 @@ TEST(GroupEventsTest, GroupTensorFlowLoopTest) {
   CreateXEvent(&device_plane_builder, &stream, "matmul", 200, 300,
                {{StatType::kCorrelationId, kCorrelationId}});
 
+  auto sync_flag_line = device_plane_builder.GetOrCreateLine(1);
+  sync_flag_line.SetName(kTensorCoreSyncFlagLineName);
+  CreateXEvent(&device_plane_builder, &sync_flag_line, "SyncWait", 200, 300,
+               {{StatType::kRawValue, kRawValue}});
+
   EventForest event_forest;
   GroupTfEvents(&space, &event_forest);
   const GroupMetadataMap& group_metadata_map =
       event_forest.GetGroupMetadataMap();
   XPlaneVisitor device_plane_visitor = CreateTfXPlaneVisitor(device_plane);
+  EXPECT_EQ(device_plane->lines(1).events(0).stats_size(), 1);
+  EXPECT_EQ(device_plane_visitor.GetStatType(
+                device_plane->lines(1).events(0).stats(0).metadata_id()),
+            StatType::kRawValue);
   EXPECT_EQ(device_plane->lines(0).events(0).stats_size(), 3);
   EXPECT_EQ(device_plane_visitor.GetStatType(
                 device_plane->lines(0).events(0).stats(1).metadata_id()),
@@ -711,6 +723,36 @@ TEST(GroupTPUEventsTest, TpuProgramCallbackTest) {
   XPlaneVisitor host_plane_visitor = CreateTfXPlaneVisitor(&space.planes(0));
   host_plane_visitor.ForEachLine([&](const XLineVisitor& line) {
     line.ForEachEvent([&](const XEventVisitor& event) {
+      // All events should be grouped and have `group_id` set.
+      EXPECT_TRUE(event.GetStat(StatType::kGroupId).has_value());
+    });
+  });
+}
+
+TEST(GroupTPUEventsTest, ModuleRootEventTest) {
+  tensorflow::profiler::XSpace space;
+  tensorflow::profiler::XPlane* device_plane = space.add_planes();
+  XPlaneBuilder device_plane_builder(device_plane);
+  device_plane_builder.ReserveLines(1);
+  auto step_line = device_plane_builder.GetOrCreateLine(0);
+  step_line.SetName("Steps");
+  CreateXEvent(&device_plane_builder, &step_line, "1", 100, 200,
+               {{StatType::kStepNum, int64_t{1}}});
+  auto module_line = device_plane_builder.GetOrCreateLine(1);
+  module_line.SetName("XLA Modules");
+  CreateXEvent(&device_plane_builder, &module_line, "module", 105, 199,
+               {{StatType::kRunId, int64_t{123}},
+                {StatType::kQueueId, int64_t{0}},
+                {StatType::kDeviceOrdinal, int64_t{1}}});
+  auto hlo_line = device_plane_builder.GetOrCreateLine(2);
+  hlo_line.SetName("XLA Ops");
+  CreateXEvent(&device_plane_builder, &hlo_line, "matmul", 110, 190, {});
+  EventForest event_forest;
+  GroupTpuEventsOSS(&space, {device_plane}, &event_forest);
+  XPlaneVisitor device_plane_visitor = CreateTfXPlaneVisitor(&space.planes(0));
+  device_plane_visitor.ForEachLine([&](const XLineVisitor& line) {
+    line.ForEachEvent([&](const XEventVisitor& event) {
+      SCOPED_TRACE(absl::StrCat(line.Name(), " ", event.Name()));
       // All events should be grouped and have `group_id` set.
       EXPECT_TRUE(event.GetStat(StatType::kGroupId).has_value());
     });

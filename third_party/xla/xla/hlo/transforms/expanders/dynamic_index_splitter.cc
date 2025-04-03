@@ -15,11 +15,14 @@ limitations under the License.
 
 #include "xla/hlo/transforms/expanders/dynamic_index_splitter.h"
 
-#include <map>
+#include <cstdint>
+#include <utility>
+#include <vector>
 
-#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "absl/container/inlined_vector.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -47,7 +50,7 @@ absl::StatusOr<bool> DynamicIndexSplitter::Run(
       }
       auto parent = dynamic_op->parent();
       bool is_update = dynamic_op->opcode() == HloOpcode::kDynamicUpdateSlice;
-      int64_t num_indices = dynamic_op->operand(0)->shape().rank();
+      int64_t num_indices = dynamic_op->operand(0)->shape().dimensions_size();
 
       if (num_indices == 0) {
         // If the operand rank is 0, directly replace R0 DS/DUS with the
@@ -71,7 +74,7 @@ absl::StatusOr<bool> DynamicIndexSplitter::Run(
         // This DS/DUS already uses scalar indices.
         continue;
       }
-      TF_RET_CHECK(index_operand->shape().rank() == 1);
+      TF_RET_CHECK(index_operand->shape().dimensions_size() == 1);
       auto index_element_type = index_operand->shape().element_type();
       std::vector<HloInstruction*> index_array;
       index_array.reserve(num_indices);

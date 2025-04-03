@@ -12,6 +12,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include <cstdint>
+#include <memory>
+#include <utility>
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/STLExtras.h"
@@ -159,7 +163,7 @@ class OptimizeTfForTfrt
 
     EliminateCommonMultinomialOps(func.getBody().front());
 
-    if (mlir::failed(mlir::applyPatternsAndFoldGreedily(func, patterns_)))
+    if (mlir::failed(mlir::applyPatternsGreedily(func, patterns_)))
       signalPassFailure();
   }
 

@@ -46,8 +46,7 @@ using tsl::ReadBoolFromEnvVar;
 // GpuTracer for GPU.
 class GpuTracer : public tsl::profiler::ProfilerInterface {
  public:
-  GpuTracer(CuptiTracer* cupti_tracer, CuptiInterface* cupti_interface)
-      : cupti_tracer_(cupti_tracer) {
+  explicit GpuTracer(CuptiTracer* cupti_tracer) : cupti_tracer_(cupti_tracer) {
     VLOG(1) << "GpuTracer created.";
   }
   ~GpuTracer() override {}
@@ -153,7 +152,7 @@ absl::Status GpuTracer::DoStart() {
   cupti_collector_ = CreateCuptiCollector(collector_options, start_walltime_ns,
                                           start_gputime_ns);
 
-  cupti_tracer_->Enable(options_, cupti_collector_.get());
+  cupti_tracer_->Enable(options_, cupti_collector_.get()).IgnoreError();
   return absl::OkStatus();
 }
 
@@ -227,8 +226,7 @@ std::unique_ptr<tsl::profiler::ProfilerInterface> CreateGpuTracer(
   if (!cupti_tracer->IsAvailable()) {
     return nullptr;
   }
-  profiler::CuptiInterface* cupti_interface = profiler::GetCuptiInterface();
-  return std::make_unique<profiler::GpuTracer>(cupti_tracer, cupti_interface);
+  return std::make_unique<profiler::GpuTracer>(cupti_tracer);
 }
 
 auto register_gpu_tracer_factory = [] {

@@ -67,7 +67,8 @@ int64_t FindMostFrequentScatterDim(
     frequency.resize(std::max(dim + 1, static_cast<int64_t>(frequency.size())),
                      0);
     frequency[dim]++;
-    min_rank = std::min(min_rank, it->shape().rank());
+    min_rank =
+        std::min(min_rank, static_cast<int64_t>(it->shape().dimensions_size()));
   }
 
   int64_t most_frequent_dim = std::distance(
@@ -125,7 +126,7 @@ absl::Status CombineReduceScatters(
 
       // Build permutation to align gather dimension.
       auto& perm = operand_permutations.back();
-      perm = std::vector<int64_t>(operand_shape.rank());
+      perm = std::vector<int64_t>(operand_shape.dimensions_size());
       std::iota(perm->begin(), perm->end(), 0);
       std::swap((*perm)[most_frequent_dim], (*perm)[rs->scatter_dimension()]);
 
@@ -138,15 +139,16 @@ absl::Status CombineReduceScatters(
   }
 
   // Create combined scatter-reduce op with a tuple result.
-  HloInstruction* combined;
   TF_RET_CHECK(operands.size() >= 2);
-  combined = computation.AddInstruction(HloInstruction::CreateReduceScatter(
-      ShapeUtil::MakeTupleShape(output_shapes), operands, reduction,
-      to_combine.front()->device_list(),
-      /*constrain_layout=*/false, to_combine.front()->channel_id(),
-      Cast<HloReduceScatterInstruction>(to_combine.front())
-          ->use_global_device_ids(),
-      most_frequent_dim));
+  HloInstruction* combined =
+      computation.AddInstruction(HloInstruction::CreateReduceScatter(
+          ShapeUtil::MakeTupleShape(output_shapes), operands, reduction,
+          to_combine.front()->device_list(),
+          /*constrain_layout=*/false, to_combine.front()->channel_id(),
+          Cast<HloReduceScatterInstruction>(to_combine.front())
+              ->use_global_device_ids(),
+          most_frequent_dim));
+  combined->set_metadata(to_combine.front()->metadata());
 
   // We have to propagate the sharding manually because Domain instructions are
   // not guaranteed to preserve it for side effecting instructions.
@@ -221,6 +223,13 @@ absl::StatusOr<bool> ReduceScatterCombiner::RunWithKeyCombiner(
   bool changed = false;
   for (HloComputation* computation :
        module->MakeNonfusionComputations(execution_threads)) {
+    if (!combine_while_loops_ &&
+        computation->GetUniqueCaller(HloOpcode::kWhile)) {
+      VLOG(2) << "Skipping this computation because the computation is a while "
+                 "loop body: "
+              << computation->ToString();
+      continue;
+    }
     TF_ASSIGN_OR_RETURN(auto domain_map, HloDomainMap::Create(computation, ""));
 
     auto key_fn = [&](const HloInstruction* instruction) {
@@ -240,10 +249,12 @@ absl::StatusOr<bool> ReduceScatterCombiner::RunWithKeyCombiner(
 
 ReduceScatterCombiner::ReduceScatterCombiner(int64_t combine_threshold_in_bytes,
                                              int64_t combine_threshold_count,
-                                             bool combine_by_dim)
+                                             bool combine_by_dim,
+                                             bool combine_while_loops)
     : combine_threshold_in_bytes_(combine_threshold_in_bytes),
       combine_threshold_count_(combine_threshold_count),
-      combine_by_dim_(combine_by_dim) {}
+      combine_by_dim_(combine_by_dim),
+      combine_while_loops_(combine_while_loops) {}
 
 absl::StatusOr<bool> ReduceScatterCombiner::Run(
     HloModule* module,

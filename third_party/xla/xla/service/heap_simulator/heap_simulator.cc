@@ -58,9 +58,9 @@ limitations under the License.
 #include "xla/service/hlo_value.h"
 #include "xla/service/logical_buffer.h"
 #include "xla/service/time_utils.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
@@ -944,6 +944,36 @@ bool BufferIntervalTree::Remove(int64_t start, int64_t end,
   return true;
 }
 
+int BufferIntervalTree::NumChunksOverlappingInTime(int64_t start,
+                                                   int64_t end) const {
+  int result = 0;
+  if (root_ == nullptr) {
+    return result;
+  }
+  std::vector<const BufferIntervalTreeNode*> visiting_stack;
+  visiting_stack.push_back(root_);
+  while (!visiting_stack.empty()) {
+    const BufferIntervalTreeNode* top = visiting_stack.back();
+    visiting_stack.pop_back();
+    if (start > top->subtree_end) {
+      continue;
+    }
+    if (top->left != nullptr) {
+      visiting_stack.push_back(top->left);
+    }
+    if (top->start <= end && top->end >= start) {
+      ++result;
+    }
+    if (end < top->start) {
+      continue;
+    }
+    if (top->right != nullptr) {
+      visiting_stack.push_back(top->right);
+    }
+  }
+  return result;
+}
+
 std::vector<Chunk> BufferIntervalTree::ChunksOverlappingInTime(
     int64_t start, int64_t end) const {
   std::vector<Chunk> result;
@@ -1357,7 +1387,7 @@ class SliceTimeAllPermutationIterator : public SliceTimePermutationIterator {
  private:
   SliceTimeAllPermutationIterator() = default;
 
-  int64_t num_slices_;
+  int64_t num_slices_ = 0;  // Initialize to 0
   bool done_ = true;
   std::vector<int64_t> permutation_;
 };
@@ -1580,7 +1610,7 @@ class SliceTimePreferredPermutationIterator
     return permutation_index;
   }
 
-  int64_t num_slices_;
+  int64_t num_slices_ = 0;  // Initialize to 0
   // For each value in permutation, indicates if it has a fixed value tied to
   // a sliced allocation before repacking. If fixed_permutation_values[i] is
   // true, permutation_[i] holds the fixed slice time for the slice with the
@@ -2036,8 +2066,9 @@ GlobalDecreasingSizeBestFitHeap<BufferType>::SlicedAllocationFinder::Find()
   if (preferred_offset_ >= 0) {
     ChunksSortedBySliceTime chunks = FindForOffset(preferred_offset_);
     if (!chunks.empty()) {
-      VLOG(1) << "SlicedAllocationFinder found chunks: " << "{ "
-              << absl::StrJoin(chunks, ", ", absl::StreamFormatter()) << " }";
+      VLOG(1) << "SlicedAllocationFinder found chunks: "
+              << "{ " << absl::StrJoin(chunks, ", ", absl::StreamFormatter())
+              << " }";
       return chunks;
     }
   }
@@ -2069,8 +2100,9 @@ GlobalDecreasingSizeBestFitHeap<BufferType>::SlicedAllocationFinder::Find()
     VLOG(3) << "SlicedAllocationFinder::Find() searching " << root->ToString();
     ChunksSortedBySliceTime chunks = FindInRoot(*root);
     if (!chunks.empty()) {
-      VLOG(1) << "SlicedAllocationFinder found chunks: " << "{ "
-              << absl::StrJoin(chunks, ", ", absl::StreamFormatter()) << " }";
+      VLOG(1) << "SlicedAllocationFinder found chunks: "
+              << "{ " << absl::StrJoin(chunks, ", ", absl::StreamFormatter())
+              << " }";
       return chunks;
     }
   }
@@ -2304,7 +2336,7 @@ GlobalDecreasingSizeBestFitHeap<BufferType>::Finish() {
   VLOG(1) << "result heap_size: " << result_.heap_size;
   Result result;
   result.heap_size = result_.heap_size;
-  result.heap_results.emplace_back(result_);
+  result.heap_results.push_back(result_);
   return result;
 }
 

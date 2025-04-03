@@ -29,14 +29,15 @@ limitations under the License.
 #include "xla/literal_util.h"
 #include "xla/primitive_util.h"
 #include "xla/reference_util.h"
+#include "xla/service/platform_util.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/stream_executor_memory_allocator.h"
 #include "xla/tests/client_library_test_base.h"
 #include "xla/tests/hlo_test_base.h"
 #include "xla/tests/test_macros.h"
+#include "xla/tsl/platform/test.h"
+#include "xla/tsl/platform/test_benchmark.h"
 #include "tsl/platform/ml_dtypes.h"
-#include "tsl/platform/test.h"
-#include "tsl/platform/test_benchmark.h"
 
 #if TENSORFLOW_USE_ROCM
 #include "rocm/rocm_config.h"
@@ -311,7 +312,7 @@ class ParametricDotTest : public DotOperationTest,
                                ->GetDeviceDescription()
                                .gpu_compute_capability();
     if (std::holds_alternative<se::RocmComputeCapability>(gpu_comp)) {
-      std::string_view name(
+      absl::string_view name(
           ::testing::UnitTest::GetInstance()->current_test_info()->name());
       if (name.find("TestF16/270x270x520_MajorToMinor") != std::string::npos) {
         GTEST_SKIP() << "Not supported on ROCm until Triton is re-enabled.";
@@ -687,8 +688,8 @@ XLA_TYPED_TEST(DotOperationTestForBatchMatMul, DISABLED_ON_TPU(Types)) {
   auto y = Parameter(&builder, 1, ShapeUtil::MakeShapeWithType<T>({2, 2, 2, 2}),
                      "y");
 
-  auto x_flat = Reshape(x, {0, 1, 2, 3}, {4, 2, 2});
-  auto y_flat = Reshape(y, {0, 1, 2, 3}, {4, 2, 2});
+  auto x_flat = Reshape(x, {4, 2, 2});
+  auto y_flat = Reshape(y, {4, 2, 2});
 
   // Slice batches into individual matrices and multiply them.
   std::vector<XlaOp> out_slices;
@@ -697,16 +698,16 @@ XLA_TYPED_TEST(DotOperationTestForBatchMatMul, DISABLED_ON_TPU(Types)) {
   for (int i = 0; i < n; ++i) {
     // Slice off individual matrices and reshape to 2D tensors.
     auto x_slice = Slice(x_flat, {i, 0, 0}, {i + 1, 2, 2}, {1, 1, 1});
-    x_slice = Reshape(x_slice, {0, 1, 2}, {2, 2});
+    x_slice = Reshape(x_slice, {2, 2});
     auto y_slice = Slice(y_flat, {i, 0, 0}, {i + 1, 2, 2}, {1, 1, 1});
-    y_slice = Reshape(y_slice, {0, 1, 2}, {2, 2});
+    y_slice = Reshape(y_slice, {2, 2});
 
     auto out = Dot(x_slice, y_slice);
-    out = Reshape(out, {0, 1}, {1, 2, 2});
+    out = Reshape(out, {1, 2, 2});
     out_slices.push_back(out);
   }
   auto out_flat = ConcatInDim(&builder, out_slices, 0);
-  Reshape(out_flat, {0, 1, 2}, {2, 2, 2, 2});
+  Reshape(out_flat, {2, 2, 2, 2});
 
   auto x_data = this->client_
                     ->TransferToServer(LiteralUtil::CreateR4FromArray4D<T>(
@@ -2037,30 +2038,15 @@ ENTRY SmallIntegerDot {
   EXPECT_TRUE(RunAndCompare(hlo_string, ErrorSpec{0, 0}));
 }
 
-XLA_TEST_F(DotOperationTextTest, DISABLED_ON_GPU(PackedNibbleDot)) {
+XLA_TEST_F(DotOperationTextTest, DISABLED_ON_TPU(S4Dot)) {
   absl::string_view hlo_string =
       R"(
 HloModule SmallIntegerDot
 
 ENTRY SmallIntegerDot {
-  arg0 = s8[20,55] parameter(0)
-  arg1 = s8[55,20] parameter(1)
-  ROOT dot = s32[20,20] dot(arg0, arg1), lhs_contracting_dims={1}, rhs_contracting_dims={0}, operand_precision={PACKED_NIBBLE, PACKED_NIBBLE}
-}
-)";
-
-  EXPECT_TRUE(RunAndCompare(hlo_string, ErrorSpec{0, 0}));
-}
-
-XLA_TEST_F(DotOperationTextTest, UnsignedPackedNibbleDot) {
-  absl::string_view hlo_string =
-      R"(
-HloModule SmallIntegerDot
-
-ENTRY SmallIntegerDot {
-  arg0 = u8[3,11,21] parameter(0)
-  arg1 = u8[55,21,3] parameter(1)
-  ROOT dot = u32[3,11,55] dot(arg0, arg1), lhs_batch_dims={0}, lhs_contracting_dims={2}, rhs_batch_dims={2}, rhs_contracting_dims={1}, operand_precision={PACKED_NIBBLE, PACKED_NIBBLE}
+  arg0 = s4[20,2] parameter(0)
+  arg1 = s4[2,20] parameter(1)
+  ROOT dot = s4[20,20] dot(arg0, arg1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
 }
 )";
 

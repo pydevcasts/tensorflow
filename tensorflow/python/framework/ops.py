@@ -318,7 +318,11 @@ class _EagerTensorBase(
     return cast(np.ndarray, self._numpy()).__index__()
 
   def __bool__(self) -> bool:
-    return bool(self._numpy())
+    x = self._numpy()
+    if isinstance(x, np.ndarray):
+      return bool(x.size > 0 and x)
+    else:
+      return bool(x)
 
   __nonzero__ = __bool__
 
@@ -367,6 +371,27 @@ class _EagerTensorBase(
       return cast(np.ndarray, a)
 
     return np.array(a, dtype=dtype)
+
+  def __dlpack__(
+      self, *, stream=None, max_version=None, dl_device=None, copy=None  # pylint: disable=redefined-outer-name
+  ):
+    del max_version  # Unused
+    if stream is not None:
+      raise RuntimeError(
+          "tf.Tensor does not support DLPack export with a non-None stream"
+      )
+    if dl_device is not None:
+      raise RuntimeError(
+          "tf.Tensor does not support DLPack export with a non-None dl_device"
+      )
+    if copy:
+      raise RuntimeError(
+          "tf.Tensor does not support DLPack export with a copy=True"
+      )
+    return pywrap_tfe.TFE_ToDlpackCapsule(self)
+
+  def __dlpack_device__(self):
+    return pywrap_tfe.TFE_DlpackDevice(self)
 
   def __hash__(self) -> int:
     # EagerTensors are never hashable.

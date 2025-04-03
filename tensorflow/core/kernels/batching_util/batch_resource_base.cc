@@ -37,6 +37,7 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
+#include "xla/tsl/platform/criticality.h"
 #include "tensorflow/core/common_runtime/cost_constants.h"
 #include "tensorflow/core/common_runtime/cost_measurement.h"
 #include "tensorflow/core/common_runtime/cost_measurement_registry.h"
@@ -73,7 +74,6 @@ limitations under the License.
 #include "tensorflow/core/profiler/lib/traceme.h"
 #include "tensorflow/core/profiler/lib/traceme_encode.h"
 #include "tensorflow/core/util/incremental_barrier.h"
-#include "tsl/platform/criticality.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/statusor.h"
 
@@ -212,6 +212,17 @@ void RecordBatchDelayUsV2(int64_t batch_delay_us, const string& model_name,
       monitoring::Buckets::Exponential(1, 2, 27));
   cell->GetCell(model_name, op_name, std::to_string(batch_size))
       ->Add(static_cast<double>(batch_delay_us));
+}
+
+void RecordBatchTaskSizeSum(int32_t batch_task_size,
+                            int32_t unbatched_task_size,
+                            const string& model_name, const string& op_name) {
+  static auto* cell = tensorflow::monitoring::Counter<3>::New(
+      "/tensorflow/serving/batching/batch_task_size_sum",
+      "Tracks the sum of the task sizes in a batch.", "model_name", "op_name",
+      "is_batched");
+  cell->GetCell(model_name, op_name, "true")->IncrementBy(batch_task_size);
+  cell->GetCell(model_name, op_name, "false")->IncrementBy(unbatched_task_size);
 }
 
 void RecordBatchParamBatchTimeoutMicros(int64_t batch_timeout_micros,
@@ -694,6 +705,9 @@ absl::Status BatchResourceBase::ConcatInputTensors(
              {"padding_amount", padding_amount},
              {"disable_padding", disable_padding}});
       });
+  RecordBatchTaskSizeSum(batch.size(), unbatched_tasks_size,
+                         GetModelName(context), context->op_kernel().name());
+
   // TODO(b/316379576): Add metrics for the breakdown between the size of the
   // original batch size and the unbatched task size and update the batch size
   // to include the unbatched tasks.

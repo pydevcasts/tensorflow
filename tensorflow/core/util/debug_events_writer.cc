@@ -25,7 +25,7 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/lib/strings/stringprintf.h"
 #include "tensorflow/core/platform/host_info.h"
-#include "tensorflow/core/public/version.h"
+#include "tensorflow/core/public/release_version.h"
 
 namespace tensorflow {
 namespace tfdbg {
@@ -69,7 +69,7 @@ absl::Status SingleDebugEventFileWriter::Init() {
 }
 
 void SingleDebugEventFileWriter::WriteSerializedDebugEvent(
-    StringPiece debug_event_str) {
+    absl::string_view debug_event_str) {
   if (record_writer_ == nullptr) {
     if (!Init().ok()) {
       LOG(ERROR) << "Write failed because file could not be opened.";

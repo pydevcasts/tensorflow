@@ -156,10 +156,6 @@ def Ifrt_RemapArraysOp
   let hasVerifier = 1;
 }
 
-def IoAliasesAttr : TypedArrayAttrBase<
-    ConfinedAttr<DenseI32ArrayAttr, [DenseArrayCount<2>]>,
-    "Array of pairs of aliased input/output indices">;
-
 def Ifrt_CallOp : Ifrt_Op<"Call",
     [AttrSizedOperandSegments,
      NestedInIfrtFunc,
@@ -192,9 +188,11 @@ def Ifrt_CallOp : Ifrt_Op<"Call",
   let arguments = (ins
     Variadic<Ifrt_ArrayType>:$inputs,
     Variadic<Ifrt_ControlType>:$control_inputs,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs,
     SymbolRefAttr:$callee,
     Ifrt_DevicesAttr:$devices,
-    DefaultValuedAttr<IoAliasesAttr, "{}">:$io_aliases,
+    DefaultValuedAttr<Ifrt_IoAliasesAttr, "{}">:$io_aliases,
     DefaultValuedAttr<DenseI32ArrayAttr, "{}">:$donated_input_indices);
   let results = (outs
     Variadic<Ifrt_ArrayType>:$outputs,
@@ -233,8 +231,10 @@ def Ifrt_CallLoadedExecutableOp : Ifrt_Op<"CallLoadedExecutable",
   let arguments = (ins
     Variadic<Ifrt_ArrayType>:$inputs,
     Variadic<Ifrt_ControlType>:$control_inputs,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs,
     SymbolRefAttr:$callee,
-    DefaultValuedAttr<IoAliasesAttr, "{}">:$io_aliases,
+    DefaultValuedAttr<Ifrt_IoAliasesAttr, "{}">:$io_aliases,
     DefaultValuedAttr<DenseI32ArrayAttr, "{}">:$donated_input_indices);
   let results = (outs
     Variadic<Ifrt_ArrayType>:$outputs,

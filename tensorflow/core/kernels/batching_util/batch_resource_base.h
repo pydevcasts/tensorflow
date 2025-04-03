@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/blocking_counter.h"
+#include "xla/tsl/platform/criticality.h"
 #include "tensorflow/core/common_runtime/cost_measurement_registry.h"
 #include "tensorflow/core/common_runtime/request_cost.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -42,7 +43,6 @@ limitations under the License.
 #include "tensorflow/core/platform/status.h"
 #include "tensorflow/core/platform/thread_annotations.h"
 #include "tensorflow/core/protobuf/config.pb.h"
-#include "tsl/platform/criticality.h"
 
 namespace tensorflow {
 namespace serving {
@@ -67,7 +67,7 @@ struct BatchResourceOptions {
 class BatchResourceBase : public ResourceBase {
  public:
   // Given a BatchTask (from one op invocation) with 'num_outputs'== M and
-  // splitted into N sub tasks, TensorMatrix is a N X M matrix.
+  // split into N sub tasks, TensorMatrix is a N X M matrix.
   // Namely, TensorMatrix[i][j] indicates the i-th split tensor of j-th output;
   // concatenating tensors along the 2nd dimension gives a output tensor.
   typedef std::vector<std::vector<Tensor>> TensorMatrix;

@@ -14,9 +14,6 @@
 
 #include "tensorflow/lite/experimental/litert/runtime/dmabuf_buffer.h"
 
-#include <dlfcn.h>
-#include <sys/mman.h>
-
 #include <cstddef>
 #include <memory>
 #include <utility>
@@ -24,13 +21,19 @@
 #include "absl/base/attributes.h"
 #include "absl/base/const_init.h"
 #include "absl/container/node_hash_map.h"
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "tensorflow/lite/experimental/litert/c/litert_common.h"
+#include "tensorflow/lite/experimental/litert/cc/litert_expected.h"
+
+#if LITERT_HAS_DMABUF_SUPPORT
+#include <dlfcn.h>
+#include <sys/mman.h>
+#endif  // LITERT_HAS_DMABUF_SUPPORT
 
 namespace litert {
 namespace internal {
 
+#if LITERT_HAS_DMABUF_SUPPORT
 namespace {
 
 class DmaBufLibrary {
@@ -43,50 +46,57 @@ class DmaBufLibrary {
     }
   }
 
-  static absl::StatusOr<Ptr> Create() {
+  static Expected<Ptr> Create() {
     DlHandle dlhandle(::dlopen("libdmabufheap.so", RTLD_LAZY | RTLD_LOCAL),
                       ::dlclose);
     if (!dlhandle) {
-      return absl::InternalError("libdmabufheap.so not found");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "libdmabufheap.so not found");
     }
 
     auto create_allocator = reinterpret_cast<CreateAllocator>(
         ::dlsym(dlhandle.get(), "CreateDmabufHeapBufferAllocator"));
     if (!create_allocator) {
-      return absl::InternalError("CreateDmabufHeapBufferAllocator not found");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "CreateDmabufHeapBufferAllocator not found");
     }
 
     auto free_allocator = reinterpret_cast<FreeAllocator>(
         ::dlsym(dlhandle.get(), "FreeDmabufHeapBufferAllocator"));
     if (!free_allocator) {
-      return absl::InternalError("FreeDmabufHeapBufferAllocator not found");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "FreeDmabufHeapBufferAllocator not found");
     }
 
     auto alloc_buffer = reinterpret_cast<AllocBuffer>(
         ::dlsym(dlhandle.get(), "DmabufHeapAlloc"));
     if (!alloc_buffer) {
-      return absl::InternalError("DmabufHeapAlloc not found");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "DmabufHeapAlloc not found");
     }
 
     void* allocator = create_allocator();
     if (!allocator) {
-      return absl::InternalError("CreateDmabufHeapBufferAllocator failed");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "CreateDmabufHeapBufferAllocator failed");
     }
 
     return Ptr(new DmaBufLibrary(std::move(dlhandle), allocator, free_allocator,
                                  alloc_buffer));
   }
 
-  absl::StatusOr<DmaBufBuffer> Alloc(size_t size) {
+  Expected<DmaBufBuffer> Alloc(size_t size) {
     int fd = alloc_buffer_(allocator_, kDmaBufHeap, size, /*flags=*/0,
                            /*legacy_align=*/0);
     if (fd < 0) {
-      return absl::InternalError("Failed to allocate DMA-BUF buffer");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "Failed to allocate DMA-BUF buffer");
     }
     void* addr =
         ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (addr == MAP_FAILED) {
-      return absl::InternalError("Failed to mem-map DMA-BUF buffer");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "Failed to mem-map DMA-BUF buffer");
     }
     records_[addr] = Record{.fd = fd, .addr = addr, .size = size};
     return DmaBufBuffer{.fd = fd, .addr = addr};
@@ -135,38 +145,50 @@ class DmaBufLibrary {
 DmaBufLibrary* TheDmaBufLibrary;
 ABSL_CONST_INIT absl::Mutex TheMutex(absl::kConstInit);
 
-absl::Status InitLibraryIfNeededUnlocked() {
+Expected<void> InitLibraryIfNeededUnlocked() {
   if (!TheDmaBufLibrary) {
-    if (auto library = DmaBufLibrary::Create(); library.ok()) {
+    if (auto library = DmaBufLibrary::Create(); library) {
       TheDmaBufLibrary = library->release();
     } else {
-      return library.status();
+      return Unexpected(library.Error());
     }
   }
   return {};
 }
 
 }  // namespace
+#endif  // LITERT_HAS_DMABUF_SUPPORT
 
 bool DmaBufBuffer::IsSupported() {
+#if LITERT_HAS_DMABUF_SUPPORT
   absl::MutexLock lock(&TheMutex);
   auto status = InitLibraryIfNeededUnlocked();
-  return status.ok();
+  return static_cast<bool>(status);
+#else   // LITERT_HAS_DMABUF_SUPPORT
+  return false;
+#endif  // LITERT_HAS_DMABUF_SUPPORT
 }
 
-absl::StatusOr<DmaBufBuffer> DmaBufBuffer::Alloc(size_t size) {
+Expected<DmaBufBuffer> DmaBufBuffer::Alloc(size_t size) {
+#if LITERT_HAS_DMABUF_SUPPORT
   absl::MutexLock lock(&TheMutex);
-  if (auto status = InitLibraryIfNeededUnlocked(); !status.ok()) {
-    return status;
+  if (auto status = InitLibraryIfNeededUnlocked(); !status) {
+    return Unexpected(status.Error());
   }
   return TheDmaBufLibrary->Alloc(size);
+#else   // LITERT_HAS_DMABUF_SUPPORT
+  return Unexpected(kLiteRtStatusErrorUnsupported,
+                    "DmaBufBuffer::Alloc not implemented for this platform");
+#endif  // LITERT_HAS_DMABUF_SUPPORT
 }
 
 void DmaBufBuffer::Free(void* addr) {
+#if LITERT_HAS_DMABUF_SUPPORT
   absl::MutexLock lock(&TheMutex);
   if (TheDmaBufLibrary) {
     TheDmaBufLibrary->Free(addr);
   }
+#endif  // LITERT_HAS_DMABUF_SUPPORT
 }
 
 }  // namespace internal

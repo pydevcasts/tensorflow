@@ -18,15 +18,15 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "absl/functional/bind_front.h"
 #include "xla/python/ifrt/client.h"
 #include "xla/python/ifrt/device_test_util.h"
+#include "xla/python/ifrt/ir/sharding_param.h"
 #include "xla/python/ifrt/memory.h"
 #include "xla/python/ifrt/serdes.h"
 #include "xla/python/ifrt/serdes.pb.h"
 #include "xla/python/ifrt/shape.h"
 #include "xla/python/ifrt/sharding.h"
-#include "tsl/platform/statusor.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace ifrt {
@@ -40,13 +40,13 @@ TEST_P(ShardingSerDesTest, SingleDeviceShardingRoundTrip) {
   auto sharding = SingleDeviceSharding::Create(
       GetDevices({0})->devices().front(), MemoryKind("abc"));
 
-  TF_ASSERT_OK_AND_ASSIGN(auto serialized, Serialize(*sharding));
+  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
+                          Serialize(*sharding, /*options=*/nullptr));
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto out_sharding,
       Deserialize<SingleDeviceSharding>(
-          serialized, std::make_unique<DeserializeShardingOptions>(
-                          absl::bind_front(&Client::LookupDevice, client()))));
+          serialized, std::make_unique<DeserializeShardingOptions>(client())));
 
   EXPECT_THAT(out_sharding->devices()->devices(),
               ElementsAreArray(sharding->devices()->devices()));
@@ -55,13 +55,13 @@ TEST_P(ShardingSerDesTest, SingleDeviceShardingRoundTrip) {
 TEST_P(ShardingSerDesTest, OpaqueShardingRoundTrip) {
   auto sharding = OpaqueSharding::Create(GetDevices({0, 1}), MemoryKind("abc"));
 
-  TF_ASSERT_OK_AND_ASSIGN(auto serialized, Serialize(*sharding));
+  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
+                          Serialize(*sharding, /*options=*/nullptr));
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto out_sharding,
       Deserialize<OpaqueSharding>(
-          serialized, std::make_unique<DeserializeShardingOptions>(
-                          absl::bind_front(&Client::LookupDevice, client()))));
+          serialized, std::make_unique<DeserializeShardingOptions>(client())));
 
   EXPECT_THAT(out_sharding->devices()->devices(),
               ElementsAreArray(sharding->devices()->devices()));
@@ -73,13 +73,13 @@ TEST_P(ShardingSerDesTest, ConcreteShardingRoundTrip) {
       /*shape=*/Shape({10, 20}),
       /*shard_shapes=*/{Shape({3, 20}), Shape({7, 20})});
 
-  TF_ASSERT_OK_AND_ASSIGN(auto serialized, Serialize(*sharding));
+  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
+                          Serialize(*sharding, /*options=*/nullptr));
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto out_sharding,
       Deserialize<ConcreteSharding>(
-          serialized, std::make_unique<DeserializeShardingOptions>(
-                          absl::bind_front(&Client::LookupDevice, client()))));
+          serialized, std::make_unique<DeserializeShardingOptions>(client())));
 
   EXPECT_THAT(out_sharding->devices()->devices(),
               ElementsAreArray(sharding->devices()->devices()));
@@ -106,13 +106,13 @@ TEST_P(ShardingSerDesTest, ConcreteShardingWithDynamicShapeRoundTrip) {
       /*dynamic_shape=*/dynamic_shape,
       /*shard_dynamic_shapes=*/{shard_dynamic_shape1, shard_dynamic_shape2});
 
-  TF_ASSERT_OK_AND_ASSIGN(Serialized serialized, Serialize(*sharding));
+  TF_ASSERT_OK_AND_ASSIGN(Serialized serialized,
+                          Serialize(*sharding, /*options=*/nullptr));
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto out_sharding,
       Deserialize<ConcreteSharding>(
-          serialized, std::make_unique<DeserializeShardingOptions>(
-                          absl::bind_front(&Client::LookupDevice, client()))));
+          serialized, std::make_unique<DeserializeShardingOptions>(client())));
 
   EXPECT_THAT(out_sharding->devices()->devices(),
               ElementsAreArray(sharding->devices()->devices()));
@@ -127,19 +127,35 @@ TEST_P(ShardingSerDesTest, ConcreteEvenShardingRoundTrip) {
       /*shape=*/Shape({10, 20}),
       /*shard_shape=*/Shape({5, 20}), /*is_fully_replicated=*/true);
 
-  TF_ASSERT_OK_AND_ASSIGN(auto serialized, Serialize(*sharding));
+  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
+                          Serialize(*sharding, /*options=*/nullptr));
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto out_sharding,
       Deserialize<ConcreteEvenSharding>(
-          serialized, std::make_unique<DeserializeShardingOptions>(
-                          absl::bind_front(&Client::LookupDevice, client()))));
+          serialized, std::make_unique<DeserializeShardingOptions>(client())));
 
   EXPECT_THAT(out_sharding->devices()->devices(),
               ElementsAreArray(sharding->devices()->devices()));
   EXPECT_THAT(out_sharding->shape(), sharding->shape());
   EXPECT_THAT(out_sharding->shard_shape(), sharding->shard_shape());
   EXPECT_THAT(out_sharding->IsFullyReplicated(), sharding->IsFullyReplicated());
+}
+
+TEST_P(ShardingSerDesTest, ShardingParamShardingRoundTrip) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto sharding,
+      ShardingParamSharding::Create(ShardingParam({2, 1}, {{0}, {2}}),
+                                    GetDevices({0, 1}), MemoryKind("abc")));
+  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
+                          Serialize(*sharding, /*options=*/nullptr));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto out_sharding,
+      Deserialize<ShardingParamSharding>(
+          serialized, std::make_unique<DeserializeShardingOptions>(client())));
+  EXPECT_THAT(out_sharding->devices()->devices(),
+              ElementsAreArray(sharding->devices()->devices()));
+  EXPECT_THAT(out_sharding->sharding_param(), sharding->sharding_param());
 }
 
 INSTANTIATE_TEST_SUITE_P(NumDevices, ShardingSerDesTest,

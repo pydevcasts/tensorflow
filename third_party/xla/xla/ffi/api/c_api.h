@@ -179,10 +179,16 @@ typedef void XLA_FFI_Error_Destroy(XLA_FFI_Error_Destroy_Args* args);
 typedef enum {
   XLA_FFI_DataType_INVALID = 0,
   XLA_FFI_DataType_PRED = 1,
+  XLA_FFI_DataType_S1 = 30,
+  XLA_FFI_DataType_S2 = 26,
+  XLA_FFI_DataType_S4 = 21,
   XLA_FFI_DataType_S8 = 2,
   XLA_FFI_DataType_S16 = 3,
   XLA_FFI_DataType_S32 = 4,
   XLA_FFI_DataType_S64 = 5,
+  XLA_FFI_DataType_U1 = 31,
+  XLA_FFI_DataType_U2 = 27,
+  XLA_FFI_DataType_U4 = 22,
   XLA_FFI_DataType_U8 = 6,
   XLA_FFI_DataType_U16 = 7,
   XLA_FFI_DataType_U32 = 8,
@@ -201,6 +207,8 @@ typedef enum {
   XLA_FFI_DataType_F8E4M3B11FNUZ = 23,
   XLA_FFI_DataType_F8E5M2FNUZ = 24,
   XLA_FFI_DataType_F8E4M3FNUZ = 25,
+  XLA_FFI_DataType_F4E2M1FN = 32,
+  XLA_FFI_DataType_F8E8M0FNU = 33,
 } XLA_FFI_DataType;
 // LINT.ThenChange(ffi_test.cc)
 
@@ -255,30 +263,30 @@ typedef struct XLA_FFI_ExecutionContext XLA_FFI_ExecutionContext;
 //===----------------------------------------------------------------------===//
 
 // TypeId uniquely identifies a user-defined type in a given XLA FFI instance.
-struct XLA_FFI_TypeId {
+typedef struct XLA_FFI_TypeId {
   int64_t type_id;
-};
+} XLA_FFI_TypeId;
 
 // We use byte spans to pass strings to handlers because strings might not be
 // null terminated, and even if they are, looking for a null terminator can
 // become very expensive in tight loops.
-struct XLA_FFI_ByteSpan {
+typedef struct XLA_FFI_ByteSpan {
   const char* ptr;
   size_t len;
-};
+} XLA_FFI_ByteSpan;
 
 // A struct to pass a scalar value to FFI handler.
-struct XLA_FFI_Scalar {
+typedef struct XLA_FFI_Scalar {
   XLA_FFI_DataType dtype;
   void* value;
-};
+} XLA_FFI_Scalar;
 
 // A struct to pass a dense array to FFI handler.
-struct XLA_FFI_Array {
+typedef struct XLA_FFI_Array {
   XLA_FFI_DataType dtype;
   size_t size;
   void* data;
-};
+} XLA_FFI_Array;
 
 //===----------------------------------------------------------------------===//
 // Future
@@ -431,12 +439,12 @@ XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_CallFrame, attrs);
 typedef XLA_FFI_Error* XLA_FFI_Handler(XLA_FFI_CallFrame* call_frame);
 
 // XLA FFI handlers for execution stages (see XLA_FFI_ExecutionStage).
-struct XLA_FFI_Handler_Bundle {
+typedef struct XLA_FFI_Handler_Bundle {
   XLA_FFI_Handler* instantiate;  // optional
   XLA_FFI_Handler* prepare;      // optional
   XLA_FFI_Handler* initialize;   // optional
   XLA_FFI_Handler* execute;      // required
-};
+} XLA_FFI_Handler_Bundle;
 
 enum XLA_FFI_Handler_TraitsBits {
   // Calls to FFI handler are safe to trace into the command buffer. It means
@@ -466,17 +474,22 @@ typedef XLA_FFI_Error* XLA_FFI_Handler_Register(
 // TypeId
 //===----------------------------------------------------------------------===//
 
+#define XLA_FFI_UNKNOWN_TYPE_ID XLA_FFI_TypeId{0}
+
 struct XLA_FFI_TypeId_Register_Args {
   size_t struct_size;
   XLA_FFI_Extension_Base* extension_start;
 
   XLA_FFI_ByteSpan name;
-  XLA_FFI_TypeId* type_id;  // out
+  XLA_FFI_TypeId* type_id;  // in-out
 };
 
 XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_TypeId_Register_Args, type_id);
 
-// Registers user type `name` and returns a unique `type_id`.
+// Registers user type `name` with XLA. If type id is `XLA_FFI_UNKNOWN_TYPE_ID`,
+// XLA will assign a unique type id and return it in `type_id` out argument,
+// otherwise XLA will verify that type id is unique and matches the type id of
+// the type registered with the same `name` earlier.
 typedef XLA_FFI_Error* XLA_FFI_TypeId_Register(
     XLA_FFI_TypeId_Register_Args* args);
 
@@ -618,6 +631,65 @@ XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_ThreadPool_Schedule_Args, data);
 typedef XLA_FFI_Error* XLA_FFI_ThreadPool_Schedule(
     XLA_FFI_ThreadPool_Schedule_Args* args);
 
+struct XLA_FFI_ThreadPool_NumThreads_Args {
+  size_t struct_size;
+  XLA_FFI_Extension_Base* extension_start;
+
+  XLA_FFI_ExecutionContext* ctx;
+  int64_t* num_threads;  // out
+};
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_ThreadPool_NumThreads_Args, num_threads);
+
+// Returns the number of threads in the thread pool managed by XLA runtime.
+typedef XLA_FFI_Error* XLA_FFI_ThreadPool_NumThreads(
+    XLA_FFI_ThreadPool_NumThreads_Args* args);
+
+//===----------------------------------------------------------------------===//
+// RunId
+//===----------------------------------------------------------------------===//
+
+// RunId is a unique identifier for a particular "logical execution" of an XLA
+// model.
+//
+// A logical execution might encompass multiple executions of one or more
+// HloModules. Runs that are part of the same logical execution can communicate
+// via collective ops, whereas runs that are part of different logical
+// executions are isolated.
+//
+// Corresponds to `::xla::RunId` (see `xla/executable_run_options.h`).
+
+struct XLA_FFI_RunId_Get_Args {
+  size_t struct_size;
+  XLA_FFI_Extension_Base* extension_start;
+
+  XLA_FFI_ExecutionContext* ctx;
+  int64_t run_id;  // out
+};
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_RunId_Get_Args, run_id);
+
+// Returns a unique identifier for the current logical execution.
+typedef XLA_FFI_Error* XLA_FFI_RunId_Get(XLA_FFI_RunId_Get_Args* args);
+
+//===----------------------------------------------------------------------===//
+// DeviceOrdinal
+//===----------------------------------------------------------------------===//
+
+struct XLA_FFI_DeviceOrdinal_Get_Args {
+  size_t struct_size;
+  XLA_FFI_Extension_Base* extension_start;
+
+  XLA_FFI_ExecutionContext* ctx;
+  int32_t device_ordinal;  // out
+};
+
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_DeviceOrdinal_Get_Args, device_ordinal);
+
+// Returns a unique identifier for the current logical execution.
+typedef XLA_FFI_Error* XLA_FFI_DeviceOrdinal_Get(
+    XLA_FFI_DeviceOrdinal_Get_Args* args);
+
 //===----------------------------------------------------------------------===//
 // Metadata extension
 //===----------------------------------------------------------------------===//
@@ -662,14 +734,17 @@ struct XLA_FFI_Api {
   _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_DeviceMemory_Allocate);
   _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_DeviceMemory_Free);
   _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_ThreadPool_Schedule);
+  _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_ThreadPool_NumThreads);
   _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_Future_Create);
   _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_Future_SetAvailable);
   _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_Future_SetError);
+  _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_RunId_Get);
+  _XLA_FFI_API_STRUCT_FIELD(XLA_FFI_DeviceOrdinal_Get);
 };
 
 #undef _XLA_FFI_API_STRUCT_FIELD
 
-XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Api, XLA_FFI_Stream_Get);
+XLA_FFI_DEFINE_STRUCT_TRAITS(XLA_FFI_Api, XLA_FFI_DeviceOrdinal_Get);
 
 const XLA_FFI_Api* XLA_FFI_GetApi();
 

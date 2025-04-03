@@ -17,7 +17,10 @@ limitations under the License.
 
 #include <cstdint>
 
-namespace stream_executor::gpu::internal {
+#include "xla/stream_executor/kernel_spec.h"
+
+namespace stream_executor::gpu {
+namespace internal {
 
 // We want to be able to load those kernels by symbol name, so let's make them
 // C functions.
@@ -33,9 +36,9 @@ __global__ void MulI32(int32_t* a, int32_t* b, int32_t* c) {
   c[index] = a[index] * b[index];
 }
 
-__global__ void IncAndCmp(int32_t* counter, bool* pred, int32_t value) {
+__global__ void IncAndCmp(int32_t* counter, bool* pred, int32_t* value) {
   int index = threadIdx.x + blockIdx.x * blockDim.x;
-  pred[index] = counter[index] < value;
+  pred[index] = counter[index] < *value;
   counter[index] += 1;
 }
 
@@ -53,4 +56,17 @@ void* GetIncAndCmpKernel() { return reinterpret_cast<void*>(&IncAndCmp); }
 
 void* GetAddI32Ptrs3Kernel() { return reinterpret_cast<void*>(&AddI32Ptrs3); }
 
-}  // namespace stream_executor::gpu::internal
+}  // namespace internal
+
+MultiKernelLoaderSpec GetAddI32KernelSpec() {
+  MultiKernelLoaderSpec spec(/*arity=*/3);
+  spec.AddInProcessSymbol(internal::GetAddI32Kernel(), "AddI32");
+  return spec;
+}
+
+MultiKernelLoaderSpec GetAddI32PtxKernelSpec() {
+  MultiKernelLoaderSpec spec(/*arity=*/3);
+  spec.AddCudaPtxInMemory(internal::kAddI32KernelPtx, "AddI32");
+  return spec;
+}
+}  // namespace stream_executor::gpu

@@ -19,15 +19,14 @@
 #include <optional>
 #include <string>
 
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
 #include "third_party/odml/infra/southbound/sb_api.h"
+#include "tensorflow/lite/experimental/litert/cc/litert_expected.h"
 
-namespace litert {
-namespace google_tensor {
+namespace litert::google_tensor {
 
 class Southbound {
  public:
+  using Ptr = std::unique_ptr<Southbound>;
   struct ThrFunctions;
 
   Southbound(Southbound&) = delete;
@@ -37,17 +36,16 @@ class Southbound {
 
   ~Southbound();
 
-  static absl::StatusOr<std::unique_ptr<Southbound>> Create(
-      std::optional<std::string> shared_library_dir);
+  static Expected<Ptr> Create(std::optional<std::string> shared_library_dir);
 
-  const ThrFunctions& thr_functions() const { return *thr_functions_; }
+  const ThrFunctions& api() const { return *api_; }
 
  private:
   Southbound();
-  absl::Status LoadSymbols(std::optional<std::string> shared_library_dir);
+  Expected<void> LoadSymbols(std::optional<std::string> shared_library_dir);
 
   void* dlib_handle_ = nullptr;
-  std::unique_ptr<ThrFunctions> thr_functions_;
+  std::unique_ptr<ThrFunctions> api_;
 };
 
 // A convenient struct for holding function pointers to SouthBound symbols.
@@ -111,11 +109,18 @@ struct Southbound::ThrFunctions {
       thr_invocation_context_attach_input_buffer_sync_fence = nullptr;
   decltype(&thrInvocationContextGetOutputBufferSyncFence)
       thr_invocation_context_get_output_buffer_sync_fence = nullptr;
+  decltype(&thrInvocationContextDetachInputBufferSyncFence)
+      thr_invocation_context_detach_input_buffer_sync_fence = nullptr;
 
   decltype(&thrInvocationContextQueryNodeScratchPad)
       thr_invocation_context_query_node_scratch_pad = nullptr;
   decltype(&thrInvocationContextAttachScratchPadBuffer)
       thr_invocation_context_attach_scratch_pad_buffer = nullptr;
+
+  decltype(&thrInvocationContextStartMetricsCollection)
+      thr_invocation_context_start_metrics_collection = nullptr;
+  decltype(&thrInvocationContextStopMetricsCollection)
+      thr_invocation_context_stop_metrics_collection = nullptr;
 
   decltype(&thrVendorSetSystemAttributeStr)
       thr_vendor_set_system_attribute_str = nullptr;
@@ -123,7 +128,6 @@ struct Southbound::ThrFunctions {
       thr_vendor_set_system_attribute_int64 = nullptr;
 };
 
-}  // namespace google_tensor
-}  // namespace litert
+}  // namespace litert::google_tensor
 
 #endif  // TENSORFLOW_LITE_EXPERIMENTAL_LITERT_VENDORS_GOOGLE_TENSOR_DISPATCH_SOUTHBOUND_H_

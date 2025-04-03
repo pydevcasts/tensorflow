@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/client/local_client.h"
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
@@ -47,10 +48,10 @@ limitations under the License.
 #include "xla/stream_executor/device_memory_allocator.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
 
 using xla::source_map_util::InvalidParameterArgument;
 
@@ -478,14 +479,15 @@ absl::StatusOr<std::unique_ptr<LocalExecutable>> LocalClient::Load(
       se::StreamExecutor * executor,
       backend().stream_executor(updated_options.device_ordinal()));
 
-  TF_ASSIGN_OR_RETURN(Compiler * compiler,
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<Compiler> compiler,
                       Compiler::GetForPlatform(platform()));
   TF_ASSIGN_OR_RETURN(
       std::unique_ptr<xla::AotCompilationResult> aot_result,
       compiler->LoadAotCompilationResult(serialized_aot_result));
 
-  TF_ASSIGN_OR_RETURN(std::unique_ptr<Executable> executable,
-                      aot_result->LoadExecutable(compiler, executor));
+  TF_ASSIGN_OR_RETURN(
+      std::unique_ptr<Executable> executable,
+      std::move(*aot_result).LoadExecutable(compiler.get(), executor));
   return std::make_unique<LocalExecutable>(std::move(executable),
                                            local_service_->mutable_backend(),
                                            updated_options);

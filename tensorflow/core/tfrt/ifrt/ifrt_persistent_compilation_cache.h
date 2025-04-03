@@ -47,7 +47,7 @@ class IfrtPersistentCompilationCache {
   virtual absl::StatusOr<std::unique_ptr<xla::ifrt::LoadedExecutable>>
   LookupLoadedExecutableOrCreate(
       std::unique_ptr<xla::ifrt::HloProgram> hlo_program,
-      tsl::RCReference<xla::ifrt::DeviceList> device_list,
+      xla::ifrt::DeviceListRef device_list,
       const xla::CompileOptions& xla_compile_options,
       const std::vector<tsl::RCReference<xla::ifrt::LoadedHostCallback>>&
           loaded_host_callbacks,
@@ -63,8 +63,7 @@ class IfrtPersistentCompilationCache {
   // the Tf2HloResult if hits cache. Otherwise, it will call the `value_fn` to
   // generate and return the Tf2HloResult.
   virtual absl::StatusOr<Tf2HloResult> LookupTf2HloResultOrCreate(
-      Tf2HloArg tf2hlo_arg,
-      tsl::RCReference<xla::ifrt::DeviceList> device_list);
+      Tf2HloArg tf2hlo_arg, TfToHloCompiler* tf_to_hlo_compiler);
 
   virtual bool IsXlaCompilationCacheEnabled() const { return false; }
   virtual bool IsTf2HloCompilationCacheEnabled() const { return false; }

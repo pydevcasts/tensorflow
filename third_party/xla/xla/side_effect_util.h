@@ -45,6 +45,10 @@ extern const char kXlaMaxIdsPerPartitionAttr[];
 // partition *after* an input batch is partitioned.
 extern const char kXlaMaxUniqueIdsPerPartitionAttr[];
 
+// XLA frontend attribute name for the maximum valency of a sample. Currently
+// only used for the custom combiner coarse-grain op.
+extern const char kXlaMaxValencyAttr[];
+
 // XLA frontend attribute for how to assign ids to partitions.
 extern const char kXlaShardingStrategyAttr[];
 
@@ -67,6 +71,9 @@ extern const char kXlaTableId[];
 extern const char kXlaBufferPlacementAttr[];
 extern const char kXlaBufferPlacementParam[];
 
+// XLA frontend attribute for stream annotation.
+extern const char kXlaStreamAnnotationAttr[];
+
 // XLA frontend attribute for collective matmul control.
 extern const char kXlaCollectiveMatmulAttr[];
 
@@ -74,10 +81,29 @@ extern const char kXlaCollectiveMatmulAttr[];
 extern const char kXlaCollectiveMatmulLhsAg[];
 extern const char kXlaCollectiveMatmulRhsAg[];
 extern const char kXlaCollectiveMatmulRs[];
+extern const char kXlaCollectiveMatmulNone[];
 
 // XLA frontend attribute for specifying the number of sends this recv should
 // match.
 extern const char kXlaMultiRecvCountAttr[];
+
+// XLA frontend attribute for specifying the scheduling group id annotations.
+extern const char kXlaSchedulingGroupIdAttr[];
+
+// XLA frontend attributes for specifying fusion directives.
+// MUST_FUSE: all ops labeled so should form as single fusion,
+// MAXIMAL_FUSE: all ops labeled should be in a fusion, but can be split among
+// multiple fusions, else, the compiler will return errors.
+// TODO(b/366060148): Currently, the JAX framework has not finalized on the
+// frontend attribute name for MUST_FUSE and MAXIMAL_FUSE. Update this code
+// once the name is finalized and any additional attributes related to fusion
+// are added.
+extern const char kMustFuseAttr[];
+extern const char kMaximalFuseAttr[];
+
+// XLA frontend attribute for specifying groups of collectives that should be
+// launched together.
+extern const char kCollectivesGroupAttr[];
 }  // namespace xla
 
 #endif  // XLA_SIDE_EFFECT_UTIL_H_

@@ -48,9 +48,9 @@ limitations under the License.
 #include "xla/python/pjrt_ifrt/pjrt_host_callback.h"
 #include "xla/python/pjrt_ifrt/xla_compiler.h"
 #include "xla/tsl/concurrency/ref_count.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace ifrt {
@@ -86,8 +86,7 @@ class PjRtExecutable final
  public:
   // Creates PjRtExecutable from xla::PjRtExecutable.
   static absl::StatusOr<std::unique_ptr<Executable>> Create(
-      std::shared_ptr<xla::PjRtExecutable> pjrt_executable,
-      std::unique_ptr<XlaCompileOptions> compile_options);
+      std::shared_ptr<xla::PjRtExecutable> pjrt_executable);
 
   // PjRtCompatibleExecutable implementation.
 
@@ -116,13 +115,13 @@ class PjRtExecutable final
     return pjrt_executable_->GetOutputShardings();
   }
 
-  absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtLayout>>>
+  absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
   GetParameterLayouts() const override {
     DCHECK(this);
     return pjrt_executable_->GetParameterLayouts();
   }
 
-  absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtLayout>>>
+  absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
   GetOutputLayouts() const override {
     DCHECK(this);
     return pjrt_executable_->GetOutputLayouts();
@@ -162,20 +161,13 @@ class PjRtExecutable final
     return pjrt_executable_->GetOutputMemoryKinds();
   }
 
-  const XlaCompileOptions* GetCompileOptions() const override {
-    return compile_options_.get();
-  }
-
   static char ID;  // NOLINT
 
  protected:
-  explicit PjRtExecutable(std::shared_ptr<xla::PjRtExecutable> pjrt_executable,
-                          std::unique_ptr<XlaCompileOptions> compile_options)
-      : pjrt_executable_(std::move(pjrt_executable)),
-        compile_options_(std::move(compile_options)) {}
+  explicit PjRtExecutable(std::shared_ptr<xla::PjRtExecutable> pjrt_executable)
+      : pjrt_executable_(std::move(pjrt_executable)) {}
 
   std::shared_ptr<xla::PjRtExecutable> pjrt_executable_;
-  std::unique_ptr<XlaCompileOptions> compile_options_;
 };
 
 // `LoadedExecutable` implementation that wraps a `xla::PjRtLoadedExecutable`.
@@ -225,6 +217,12 @@ class PjRtLoadedExecutable final
     return pjrt_loaded_executable_->name();
   }
 
+  absl::StatusOr<absl::Span<const int>> GetDonatableInputIndices()
+      const override {
+    return absl::UnimplementedError(
+        "PjRtLoadedExecutable::GetDonatableInputIndices is not implemented.");
+  }
+
   Future<> GetReadyFuture() const override {
     // PjRtCompiler blocks until compilation finishes and returns only the
     // executables that are ready.
@@ -242,13 +240,13 @@ class PjRtLoadedExecutable final
     return pjrt_loaded_executable_->GetOutputShardings();
   }
 
-  absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtLayout>>>
+  absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
   GetParameterLayouts() const override {
     DCHECK(this);
     return pjrt_loaded_executable_->GetParameterLayouts();
   }
 
-  absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtLayout>>>
+  absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
   GetOutputLayouts() const override {
     DCHECK(this);
     return pjrt_loaded_executable_->GetOutputLayouts();
@@ -290,7 +288,7 @@ class PjRtLoadedExecutable final
   }
   absl::StatusOr<ExecuteResult> Execute(
       absl::Span<tsl::RCReference<Array>> args, const ExecuteOptions& options,
-      std::optional<tsl::RCReference<DeviceList>> devices) override;
+      std::optional<DeviceListRef> devices) override;
 
   Future<> Delete() override;
   bool IsDeleted() const override {
@@ -324,8 +322,7 @@ class PjRtLoadedExecutable final
   PjRtLoadedExecutable(
       PjRtCompatibleClient* client,
       std::shared_ptr<xla::PjRtLoadedExecutable> pjrt_loaded_executable,
-      tsl::RCReference<DeviceList> devices,
-      std::vector<Device*> addressable_devices,
+      DeviceListRef devices, std::vector<Device*> addressable_devices,
       std::vector<tsl::RCReference<LoadedHostCallback>>
           all_loaded_host_callbacks,
       std::vector<PjRtHostSendAndRecvLoadedHostCallback*>
@@ -337,7 +334,7 @@ class PjRtLoadedExecutable final
   std::shared_ptr<xla::PjRtLoadedExecutable> pjrt_loaded_executable_;
   // Devices that `pjrt_loaded_executable_` runs on. Empty if the executable is
   // portable.
-  tsl::RCReference<DeviceList> devices_;
+  DeviceListRef devices_;
   std::vector<Device*> addressable_devices_;
   std::shared_ptr<std::vector<tsl::RCReference<LoadedHostCallback>>>
       all_loaded_host_callbacks_;

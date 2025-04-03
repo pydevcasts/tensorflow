@@ -52,7 +52,9 @@ do_external_licenses_check(){
 @com_github_googlecloudplatform_google_cloud_cpp//google
 @com_github_grpc_grpc//src/compiler
 @platforms//os
+@ml_dtypes_py//ml_dtypes
 @ruy//
+@rules_java_builtin//toolchains
 @rules_python//
 @stablehlo//stablehlo/experimental
 EOF
@@ -64,15 +66,17 @@ EOF
 @absl_py//
 @bazel_tools//src
 @bazel_tools//platforms
-@bazel_tools//tools/
+@bazel_tools//tools
 @org_tensorflow//tensorflow
 @com_google_absl//
+@internal_platforms_do_not_use//host
 @pybind11_abseil//pybind11_abseil
 //external
 @local
 @com_github_googlecloudplatform_google_cloud_cpp//
 @embedded_jdk//
 ^//$
+@ml_dtypes_py//
 @ruy//
 EOF
 
@@ -304,7 +308,7 @@ EOF
 # anything with a Windows-only toolchain, and bazel errors if trying to build
 # that directory.
 @test "bazel nobuild passes on all of TF except TF Lite and win toolchains" {
-    bazel build --experimental_cc_shared_library --nobuild --keep_going -- //tensorflow/... -//tensorflow/lite/... -//tensorflow/tools/toolchains/win/... -//tensorflow/tools/toolchains/win_1803/...
+    bazel build --experimental_cc_shared_library --nobuild --keep_going -- //tensorflow/... -//tensorflow/lite/... -//tensorflow/tools/toolchains/win/... -//tensorflow/tools/toolchains/win_1803/...  -//tensorflow/tools/toolchains/win2022/...
 }
 
 @test "API compatibility test passes, ensuring no unexpected changes to the TF API" {
@@ -316,7 +320,7 @@ EOF
 # See b/279852433 (internal).
 # TODO(b/279852433) Replace deps(//tensorflow/...) with deps(//...)
 @test "Verify that it's possible to query every TensorFlow target without BUILD errors" {
-    bazel query "deps(//tensorflow/... -//tensorflow/tools/pip_package:prebuilt_wheel_import_api_packages_test)" > /dev/null
+    bazel query "deps(//tensorflow/... -attr(tags, 'manual', //tensorflow/...))" > /dev/null
 }
 
 teardown_file() {

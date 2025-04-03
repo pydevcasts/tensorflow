@@ -55,11 +55,9 @@ class GpuOffloadingTest : public HloTestBase {
                                                int64_t min_remat_size = 0) {
     TF_EXPECT_OK(verifier().Run(module).status());
     if (!module->has_schedule()) {
-      HloMemoryScheduler scheduler(
-          [](const BufferValue& buffer) {
-            return ::xla::ShapeUtil::ByteSizeOf(buffer.shape());
-          },
-          ComputationSchedulerToModuleScheduler(DefaultMemoryScheduler));
+      HloMemoryScheduler scheduler([](const BufferValue& buffer) {
+        return ::xla::ShapeUtil::ByteSizeOf(buffer.shape());
+      });
       TF_EXPECT_OK(scheduler.Run(module).status());
     }
     // Create a configuration where any compute is much much slower than any
@@ -218,7 +216,9 @@ TEST_F(GpuOffloadingTest, CopyIRCreationTest) {
                           RunHloRematerialization(
                               /*memory_limit_bytes=*/10 * 1024, module.get()));
   ASSERT_TRUE(changed);
-  StreamAttributeAnnotator attr_annotator;
+  stream_executor::StreamExecutor* executor =
+      backend().default_stream_executor();
+  StreamAttributeAnnotator attr_annotator(executor->GetDeviceDescription());
   TF_ASSERT_OK_AND_ASSIGN(bool changed_attr, attr_annotator.Run(module.get()));
   EXPECT_TRUE(changed_attr);
   // Verify that the stream attribute for a copy-start is annotated

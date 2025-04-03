@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/container/node_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/dfs_hlo_visitor.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
@@ -247,7 +248,7 @@ class HloValueSemanticsAnalysis {
  public:
   static absl::StatusOr<std::unique_ptr<HloValueSemanticsAnalysis>> Run(
       const HloModule& module,
-      const absl::flat_hash_set<std::string_view>& execution_threads = {});
+      const absl::flat_hash_set<absl::string_view>& execution_threads = {});
   virtual ~HloValueSemanticsAnalysis() = default;
   bool HasSemanticsFor(const HloInstruction* instruction) const;
   const HloValueSemantics* GetSemantics(const HloInstruction* instruction,
@@ -277,7 +278,7 @@ class HloValueSemanticsAnalysis {
   friend class HloValueSemanticsPropagation;
   explicit HloValueSemanticsAnalysis(
       const HloModule& module,
-      const absl::flat_hash_set<std::string_view>& execution_threads);
+      const absl::flat_hash_set<absl::string_view>& execution_threads);
   virtual absl::Status InitializeEinsumDepth();
   virtual absl::Status InitializeEinsumHeight();
   // We match send and recv HLOs to propagate semantics from send to recv.

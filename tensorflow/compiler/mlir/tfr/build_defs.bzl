@@ -1,6 +1,6 @@
 """BUILD extension for TF composition project."""
 
-load("@local_tsl//third_party/py/rules_pywrap:pywrap.bzl", "use_pywrap_rules")
+load("@local_xla//third_party/py/rules_pywrap:pywrap.default.bzl", "use_pywrap_rules")
 load("//tensorflow:strict.default.bzl", "py_strict_binary", "py_strict_library")
 load("//tensorflow:tensorflow.bzl", "tf_custom_op_library", "tf_gen_op_wrapper_py")
 load("//tensorflow:tensorflow.default.bzl", "tf_custom_op_py_library")
@@ -49,7 +49,6 @@ def gen_op_libraries(
         srcs = [],
         outs = [name + ".inc.cc"],
         cmd =
-            "PYWRAP_TARGET='//third_party/tensorflow/python:_pywrap_tensorflow' " +
             "$(location %s) --output=$@ --gen_register_op=true" % gen_op_lib_exec,
         tools = [":" + gen_op_lib_exec],
         tags = tags,
@@ -114,7 +113,6 @@ def gen_op_libraries(
         srcs = [],
         outs = [name + ".mlir"],
         cmd =
-            "PYWRAP_TARGET='//third_party/tensorflow/python:_pywrap_tensorflow' " +
             "$(location %s) --output=$@ --gen_register_op=false" % gen_tfr_lib_exec,
         tools = [":" + gen_tfr_lib_exec],
         tags = tags,

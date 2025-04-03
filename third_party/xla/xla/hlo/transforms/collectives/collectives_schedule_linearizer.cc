@@ -15,15 +15,13 @@ limitations under the License.
 
 #include "xla/hlo/transforms/collectives/collectives_schedule_linearizer.h"
 
-#include <algorithm>
-#include <list>
 #include <memory>
-#include <string>
-#include <utility>
-#include <vector>
 
-#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "xla/hlo/analysis/hlo_reachability.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -45,14 +43,15 @@ absl::StatusOr<bool> CollectivesScheduleLinearizer::Run(
        module->MakeNonfusionComputations(execution_threads)) {
     std::unique_ptr<HloReachabilityMap> reachability;
     HloInstruction* prev_done = nullptr;
-    for (HloInstruction* inst : computation->MakeInstructionPostOrder()) {
+    auto post_order = computation->MakeInstructionPostOrder();
+    for (HloInstruction* inst : post_order) {
       auto* next = DynCast<HloCollectiveInstruction>(inst);
       if (!next) {
         continue;
       }
       // Build reachability map on demand if we actually see collectives.
       if (!reachability) {
-        reachability = HloReachabilityMap::Build(computation);
+        reachability = HloReachabilityMap::Build(computation, post_order);
       }
       // Derive the 'start' and 'done' peers of this instruction. For non-async
       // variants of collectives, they are the same as this instruction. For

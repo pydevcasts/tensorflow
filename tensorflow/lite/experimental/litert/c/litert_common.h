@@ -15,7 +15,7 @@
 #ifndef TENSORFLOW_LITE_EXPERIMENTAL_LITERT_C_LITERT_COMMON_H_
 #define TENSORFLOW_LITE_EXPERIMENTAL_LITERT_C_LITERT_COMMON_H_
 
-#include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,9 +23,6 @@ extern "C" {
 
 // Declares canonical opaque type.
 #define LITERT_DEFINE_HANDLE(name) typedef struct name##T* name
-// Declares an array of references to opaque type. `name` must be
-// previously declared opaque type.
-#define LITERT_DEFINE_HANDLE_ARRAY(name) typedef name* name##Array
 
 #if __ANDROID_API__ >= 26
 #define LITERT_HAS_AHWB_SUPPORT 1
@@ -43,10 +40,27 @@ extern "C" {
 #define LITERT_HAS_ION_SUPPORT 1
 #define LITERT_HAS_DMABUF_SUPPORT 1
 #define LITERT_HAS_FASTRPC_SUPPORT 1
+#define LITERT_HAS_OPENGL_SUPPORT 1
+#define LITERT_HAS_OPENCL_SUPPORT_DEFAULT 1
+// copybara:comment_begin(google-only)
+#elif defined(GOOGLE_UNSUPPORTED_OS_LOONIX)
+#define LITERT_HAS_ION_SUPPORT 0
+#define LITERT_HAS_DMABUF_SUPPORT 1
+#define LITERT_HAS_FASTRPC_SUPPORT 0
+#define LITERT_HAS_OPENCL_SUPPORT_DEFAULT 1
+// copybara:comment_end
 #else
 #define LITERT_HAS_ION_SUPPORT 0
 #define LITERT_HAS_DMABUF_SUPPORT 0
 #define LITERT_HAS_FASTRPC_SUPPORT 0
+#define LITERT_HAS_OPENCL_SUPPORT_DEFAULT 1
+#define LITERT_HAS_OPENGL_SUPPORT 0
+#endif
+
+#if defined(LITERT_DISABLE_OPENCL_SUPPORT)
+#define LITERT_HAS_OPENCL_SUPPORT 0
+#else
+#define LITERT_HAS_OPENCL_SUPPORT LITERT_HAS_OPENCL_SUPPORT_DEFAULT
 #endif
 
 #define LITERT_API_VERSION_MAJOR 0
@@ -70,13 +84,15 @@ typedef enum {
   kLiteRtStatusErrorUnsupported = 5,
   kLiteRtStatusErrorNotFound = 6,
   kLiteRtStatusErrorTimeoutExpired = 7,
+  kLiteRtStatusErrorWrongVersion = 8,
+  kLiteRtStatusErrorUnknown = 9,
 
   // File and loading related errors.
   kLiteRtStatusErrorFileIO = 500,
   kLiteRtStatusErrorInvalidFlatbuffer = 501,
   kLiteRtStatusErrorDynamicLoading = 502,
   kLiteRtStatusErrorSerialization = 503,
-  kLiteRtStatusErrorCompilationr = 504,
+  kLiteRtStatusErrorCompilation = 504,
 
   // IR related errors.
   kLiteRtStatusErrorIndexOOB = 1000,
@@ -87,30 +103,34 @@ typedef enum {
   // Tool related errors.
   kLiteRtStatusErrorInvalidToolConfig = 1500,
 
-  // Lealization related errors.
+  // Legalization related errors.
   kLiteRtStatusLegalizeNoMatch = 2000,
   kLiteRtStatusErrorInvalidLegalization = 2001,
 } LiteRtStatus;
 
-typedef enum {
-  kLiteRtAnyTypeNone = 0,
-  kLiteRtAnyTypeBool = 1,
-  kLiteRtAnyTypeInt = 2,
-  kLiteRtAnyTypeReal = 3,
-  kLiteRtAnyTypeString = 8,
-  kLiteRtAnyTypeVoidPtr = 9,
-} LiteRtAnyType;
+// Returns a string describing the status value.
+const char* LiteRtGetStatusString(LiteRtStatus status);
 
-typedef struct {
-  LiteRtAnyType type;
-  union {
-    bool bool_value;
-    int64_t int_value;
-    double real_value;
-    const char* str_value;
-    const void* ptr_value;
-  };
-} LiteRtAny;
+typedef enum : int {
+  kLiteRtHwAcceleratorNone = 0,
+  kLiteRtHwAcceleratorCpu = 1 << 0,
+  kLiteRtHwAcceleratorGpu = 1 << 1,
+  kLiteRtHwAcceleratorNpu = 1 << 2,
+} LiteRtHwAccelerators;
+
+// A bit field of `LiteRtHwAccelerators` values.
+typedef int LiteRtHwAcceleratorSet;
+
+// For indexing into LiteRT collections or counting LiteRT things.
+typedef size_t LiteRtParamIndex;
+
+#if defined(_WIN32)
+// Provides posix_memalign() missing in Windows.
+#include <errno.h>
+
+#define posix_memalign(p, a, s) \
+  (((*(p)) = _aligned_malloc((s), (a))), *(p) ? 0 : errno)
+#endif  // defined(_WIN32)
 
 #ifdef __cplusplus
 }

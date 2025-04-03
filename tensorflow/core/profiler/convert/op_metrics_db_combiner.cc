@@ -19,8 +19,10 @@ limitations under the License.
 #include <utility>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/profiler/protobuf/op_metrics.pb.h"
+#include "tsl/platform/protobuf.h"
 
 namespace tensorflow {
 namespace profiler {
@@ -87,8 +89,8 @@ void CombineOpMetrics(const OpMetrics& src, OpMetrics* dst,
 }
 
 void CombineMemoryAccessedBreakdown(
-    const protobuf::RepeatedPtrField<OpMetrics_MemoryAccessed>& src,
-    protobuf::RepeatedPtrField<OpMetrics_MemoryAccessed>* dst) {
+    const tsl::protobuf::RepeatedPtrField<OpMetrics_MemoryAccessed>& src,
+    tsl::protobuf::RepeatedPtrField<OpMetrics_MemoryAccessed>* dst) {
   if (src.empty()) return;
   absl::flat_hash_map<std::pair<uint64 /*memory_space*/, OperationType>,
                       OpMetrics_MemoryAccessed*>
@@ -125,12 +127,13 @@ void OpMetricsDbCombiner::Combine(const OpMetricsDb& src,
       dst->total_host_infeed_enq_start_timestamp_ps_diff());
   dst->set_total_time_ps(src.total_time_ps() + dst->total_time_ps());
   dst->set_total_op_time_ps(src.total_op_time_ps() + dst->total_op_time_ps());
+  dst->set_idle_time_ps(src.idle_time_ps() + dst->idle_time_ps());
+  dst->set_busy_time_ps(src.busy_time_ps() + dst->busy_time_ps());
   CombinePrecisionStats(src.precision_stats(), dst->mutable_precision_stats());
 
   for (const auto& src_metrics : src.metrics_db()) {
     auto* dst_metrics = LookupOrInsertNewOpMetrics(src_metrics.hlo_module_id(),
-                                                   src_metrics.name(),
-                                                   src_metrics.fingerprint());
+                                                   src_metrics.name());
     CopyOpMetricsMetadata(src_metrics, dst_metrics);
     CombineOpMetrics(src_metrics, dst_metrics, update_num_cores);
   }

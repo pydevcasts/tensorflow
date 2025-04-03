@@ -37,7 +37,9 @@ limitations under the License.
 #include <type_traits>
 #include <utility>
 
+#include "absl/log/check.h"
 #include "absl/strings/escaping.h"
+#include "absl/strings/string_view.h"
 #include "xla/tsl/util/byte_swap_array.h"
 #include "tensorflow/core/framework/allocation_description.pb.h"
 #include "tensorflow/core/framework/log_memory.h"
@@ -66,6 +68,7 @@ limitations under the License.
 #include "tensorflow/core/platform/protobuf.h"
 #include "tensorflow/core/platform/tensor_coding.h"
 #include "tensorflow/core/platform/types.h"
+#include "tsl/platform/ml_dtypes.h"
 
 namespace tensorflow {
 
@@ -179,8 +182,8 @@ struct Helper {
   template <typename Destination>
   static void Encode(TensorBuffer* in, int64_t n, Destination* out) {
     DCHECK_EQ(in->size(), sizeof(T) * n);
-    port::AssignRefCounted(StringPiece(in->base<const char>(), in->size()), in,
-                           out);
+    port::AssignRefCounted(
+        absl::string_view(in->base<const char>(), in->size()), in, out);
   }
 
   // Decoder of simple type T. Copy the bytes from "in" into the
@@ -562,6 +565,18 @@ struct ProtoHelper<float8_e5m2> : public Float8ProtoHelper<float8_e5m2> {};
 
 template <>
 struct ProtoHelper<float8_e4m3fn> : public Float8ProtoHelper<float8_e4m3fn> {};
+
+template <>
+struct ProtoHelper<float8_e4m3fnuz>
+    : public Float8ProtoHelper<float8_e4m3fnuz> {};
+
+template <>
+struct ProtoHelper<float8_e4m3b11fnuz>
+    : public Float8ProtoHelper<float8_e4m3b11fnuz> {};
+
+template <>
+struct ProtoHelper<float8_e5m2fnuz>
+    : public Float8ProtoHelper<float8_e5m2fnuz> {};
 
 template <typename T>
 Buffer<T>::Buffer(Allocator* a, int64_t n)
@@ -950,6 +965,9 @@ int Tensor::RefCount() const {
     CASE(Variant, SINGLE_ARG(STMTS))                           \
     CASE(float8_e5m2, SINGLE_ARG(STMTS))                       \
     CASE(float8_e4m3fn, SINGLE_ARG(STMTS))                     \
+    CASE(float8_e4m3fnuz, SINGLE_ARG(STMTS))                   \
+    CASE(float8_e4m3b11fnuz, SINGLE_ARG(STMTS))                \
+    CASE(float8_e5m2fnuz, SINGLE_ARG(STMTS))                   \
     CASE(int4, SINGLE_ARG(STMTS))                              \
     CASE(uint4, SINGLE_ARG(STMTS))                             \
     case DT_INVALID:                                           \
@@ -1190,6 +1208,13 @@ size_t Tensor::TotalBytes() const {
   return 0;  // Makes compiler happy.
 }
 
+size_t Tensor::GetBufferSize() const {
+  if (buf_) {
+    return buf_->size();
+  }
+  return 0;
+}
+
 size_t Tensor::AllocatedBytes() const {
   if (buf_) {
     size_t ret;
@@ -1414,7 +1439,7 @@ string Tensor::SummarizeValue(int64_t max_entries, bool print_v2) const {
     return strings::StrCat("uninitialized Tensor of ", num_elts,
                            " elements of type ", dtype());
   }
-  const char* data = limit > 0 ? tensor_data().data() : nullptr;
+  const char* data = limit > 0 ? (const char*)this->data() : nullptr;
   switch (dtype()) {
     case DT_BFLOAT16:
       return SummarizeArray<bfloat16>(limit, num_elts, shape_, data, print_v2);
@@ -1509,9 +1534,14 @@ string Tensor::SummarizeValue(int64_t max_entries, bool print_v2) const {
   }
 }
 
-StringPiece Tensor::tensor_data() const {
-  if (buf_ == nullptr) return StringPiece();  // Don't die for empty tensors
-  return StringPiece(static_cast<char*>(buf_->data()), TotalBytes());
+absl::string_view Tensor::tensor_data_internal() const {
+  return absl::string_view(static_cast<char*>(buf_->data()), GetBufferSize());
+}
+
+absl::string_view Tensor::tensor_data() const {
+  if (buf_ == nullptr) return absl::string_view();
+  CHECK(DataTypeCanUseMemcpy(dtype()));  // Crash OK
+  return tensor_data_internal();
 }
 
 void* Tensor::data() const {

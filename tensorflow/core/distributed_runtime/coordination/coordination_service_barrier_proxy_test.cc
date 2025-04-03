@@ -15,7 +15,6 @@ limitations under the License.
 #include "tensorflow/core/distributed_runtime/coordination/coordination_service_barrier_proxy.h"
 
 #include <atomic>
-#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -28,6 +27,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "xla/tsl/distributed_runtime/call_options.h"
 #include "xla/tsl/distributed_runtime/coordination/coordination_client.h"
@@ -63,6 +63,12 @@ class MockCoordinationServiceAgent : public CoordinationServiceAgent {
               (Env * env, std::string_view job_name, int task_id,
                const CoordinationServiceConfig& configs,
                std::unique_ptr<CoordinationClient> leader_client,
+               StatusCallback error_fn, bool recoverable),
+              (override));
+  MOCK_METHOD(absl::Status, Initialize,
+              (Env * env, std::string_view job_name, int task_id,
+               const CoordinationServiceConfig& configs,
+               std::unique_ptr<CoordinationClient> leader_client,
                StatusCallback error_fn),
               (override));
   MOCK_METHOD(absl::Status, Initialize,
@@ -82,6 +88,8 @@ class MockCoordinationServiceAgent : public CoordinationServiceAgent {
   MOCK_METHOD(absl::StatusOr<std::vector<CoordinatedTaskStateInfo>>,
               GetTaskState, (const std::vector<CoordinatedTask>& task),
               (override));
+  MOCK_METHOD(absl::StatusOr<std::vector<CoordinatedTaskStateInfo>>,
+              GetJobState, (absl::string_view job_nam), (override));
   MOCK_METHOD(absl::Status, ReportError, (const absl::Status& error),
               (override));
   MOCK_METHOD(absl::Status, Shutdown, (), (override));
@@ -118,6 +126,10 @@ class MockCoordinationServiceAgent : public CoordinationServiceAgent {
               (override));
   MOCK_METHOD(void, CancelBarrierAsync,
               (std::string_view barrier_id, StatusCallback done), (override));
+  MOCK_METHOD(absl::StatusOr<std::vector<CoordinatedTask>>, GetAliveTasks,
+              (const std::vector<CoordinatedTask>& tasks), (override));
+  MOCK_METHOD(void, AddJobStateCallback, (JobStateCallback callback),
+              (override));
   MOCK_METHOD(absl::StatusOr<Env*>, GetEnv, (), (override));
   MOCK_METHOD(void, SetError, (const absl::Status& error), (override));
   MOCK_METHOD(absl::Status, ActivateWatch,

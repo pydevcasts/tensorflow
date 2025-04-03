@@ -50,20 +50,6 @@ config_setting(
     },
 )
 
-config_setting(
-    name = "mips",
-    values = {
-        "cpu": "mips",
-    },
-)
-
-config_setting(
-    name = "mips64",
-    values = {
-        "cpu": "mips64",
-    },
-)
-
 # Without "cpu":"k8", when building with --copt=-DTF_LITE_STATIC_MEMORY, we get
 # the following error:
 # Multiple matches are not allowed unless one is unambiguously more specialized.
@@ -202,15 +188,19 @@ STABLE_FRAMEWORK_LIB_IMPL_HDRS = [
 
 exports_files(
     [hdr for hdr in FRAMEWORK_LIB_HDRS if hdr[0] != "/"],
-    visibility = ["//tensorflow/lite/core/shims:__subpackages__"],
+    visibility = [
+        "//tensorflow/lite/core/shims:__subpackages__",
+    ] + tflite_internal_cc_3p_api_deps_src_all_visibility_allowlist(),
 )
 
 cc_library(
     name = "version",
-    srcs = ["//tensorflow/core/public:version.h"],
     hdrs = ["version.h"],
     compatible_with = get_compatible_with_portable(),
     copts = tflite_copts_warnings(),
+    deps = [
+        "//tensorflow/core/public:release_version",
+    ],
 )
 
 alias(
@@ -311,6 +301,8 @@ cc_test(
         ":simple_planner",
         "//tensorflow/core:tflite_portable_logging",
         "//tensorflow/lite/core/c:common",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@com_google_googletest//:gtest_main",
     ],
 )

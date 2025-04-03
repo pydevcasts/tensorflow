@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_HLO_IR_HLO_SCHEDULE_H_
 
 #include <algorithm>
+#include <cstdint>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -49,10 +50,24 @@ class HloInstructionSequence {
     }
   }
 
+  bool operator==(const HloInstructionSequence& other) const {
+    return instruction_sequence_ == other.instruction_sequence_ &&
+           id_sequence_ == other.id_sequence_;
+  }
+
+  bool operator!=(const HloInstructionSequence& other) const {
+    return !(*this == other);
+  }
+
   // Adds the instruction to the end of the sequence.
   void push_back(HloInstruction* instruction) {
     instruction_sequence_.push_back(instruction);
     id_sequence_.push_back(instruction->unique_id());
+  }
+
+  void reserve(int64_t size) {
+    instruction_sequence_.reserve(size);
+    id_sequence_.reserve(size);
   }
 
   // Removes the instruction from the sequence.

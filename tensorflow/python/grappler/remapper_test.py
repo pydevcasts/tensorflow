@@ -78,8 +78,7 @@ class RemapperTest(test.TestCase, parameterized.TestCase):
     super(RemapperTest, self).setUp()
     # GeluApproximate fusion on GPU requires cublasLt.
     os.environ['TF_USE_CUBLASLT'] = '1'
-    # GeluExact fusion and conv runtime fusion on GPU requires cuDNN frontend.
-    os.environ['TF_CUDNN_USE_FRONTEND'] = '1'
+
     os.environ['TF_CUDNN_USE_RUNTIME_FUSION'] = '1'
 
   def maybe_skip_test(self, mode):
@@ -105,7 +104,7 @@ class RemapperTest(test.TestCase, parameterized.TestCase):
     ops.add_to_collection('train_op', model_fn)
     mg = meta_graph.create_meta_graph_def(graph=model_fn.graph)
 
-    # Compute referene
+    # Compute reference
     config = _get_config(remapping_on=False)
     gdef_ref = tf_optimizer.OptimizeGraph(config, mg)
 

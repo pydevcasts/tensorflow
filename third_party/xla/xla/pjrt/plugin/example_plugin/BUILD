@@ -1,4 +1,4 @@
-load("//xla:xla.bzl", "xla_cc_binary", "xla_cc_test")
+load("//xla:xla.default.bzl", "xla_cc_binary", "xla_cc_test")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -27,6 +27,7 @@ xla_cc_test(
     deps = [
         ":myplugin_cpp_pjrt",
         "//xla/tests:xla_internal_test_main",
+        "@com_google_googletest//:gtest",
         "@local_tsl//tsl/platform:status_matchers",
         "@local_tsl//tsl/platform:test",
     ],
@@ -56,6 +57,7 @@ xla_cc_test(
         ":myplugin_c_pjrt",
         "//xla/pjrt/c:pjrt_c_api_hdrs",
         "//xla/tests:xla_internal_test_main",
+        "@com_google_googletest//:gtest",
         "@local_tsl//tsl/platform:status_matchers",
         "@local_tsl//tsl/platform:test",
     ],

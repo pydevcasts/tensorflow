@@ -2,7 +2,7 @@ load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
 load("//tensorflow:tensorflow.default.bzl", "get_compatible_with_portable")
 load("//tensorflow/lite:build_def.bzl", "tflite_copts", "tflite_copts_warnings", "tflite_self_contained_libs_test_suite")
 load("//tensorflow/lite:special_rules.bzl", "internal_visibility_allowlist", "tflite_portable_test_suite")
-load("//tensorflow/lite/core:special_rules.bzl", "macros_visibility_allowlist")
+load("//tensorflow/lite/core:special_rules.bzl", "core_cc_api_stable_visibility_allowlist", "macros_visibility_allowlist")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -148,6 +148,19 @@ cc_library(
     alwayslink = 1,  # TODO(b/161243354): eliminate this.
 )
 
+# This is a private target, its visibility is set to public only to be
+# used by LiteRT dependencies.
+# Do not use this target directly and don't consider it as a part of the public API.
+# TODO(weiyiw): Refactor LiteRT deps from TFLite.
+alias(
+    name = "private_cc_api_stable",
+    actual = ":cc_api_stable",
+    tags = ["avoid_dep"],
+    visibility = [
+        "//visibility:public",
+    ],
+)
+
 # TODO(b/242310498): move logger.cc from tensorflow/lite/ to here.
 cc_library(
     name = "cc_api_stable",
@@ -164,7 +177,10 @@ cc_library(
         "signature_runner.h",
     ],
     compatible_with = get_compatible_with_portable(),
-    visibility = ["//tensorflow/lite:__subpackages__"],
+    visibility = [
+        "//tensorflow/lite:__subpackages__",
+        "//third_party/odml/litert/litert:__subpackages__",
+    ] + core_cc_api_stable_visibility_allowlist(),
     deps = [
         ":model_builder",
         ":signature_runner",
@@ -304,6 +320,7 @@ cc_library(
     visibility = [
         "//tensorflow/lite:__pkg__",
         "//tensorflow/lite/core:__subpackages__",
+        "//third_party/odml/infra/genai/inference/executor/google_tensor:__subpackages__",
     ],
     deps = [
         "//tensorflow/lite/c:common",
@@ -321,6 +338,7 @@ cc_test(
     srcs = ["signature_runner_test.cc"],
     data = [
         "//tensorflow/lite:testdata/multi_signatures.bin",
+        "//tensorflow/lite:testdata/reverse_signature_model.bin",
     ],
     deps = [
         ":framework",
@@ -504,6 +522,58 @@ cc_test(
         "//tensorflow/lite/c:c_api_types",
         "//tensorflow/lite/kernels:builtin_ops",  # build_cleaner: keep
         "@com_google_absl//absl/log:check",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "model_building",
+    srcs = ["model_building.cc"],
+    hdrs = ["model_building.h"],
+    deps = [
+        ":subgraph",
+        "//tensorflow/lite:framework",
+        "//tensorflow/lite/c:c_api_types",
+        "//tensorflow/lite/c:common",
+        "//tensorflow/lite/core/c:common",
+        "//tensorflow/lite/kernels:builtin_ops",
+        "//tensorflow/lite/schema:schema_fbs",
+        "@com_google_absl//absl/container:flat_hash_map",
+    ],
+)
+
+cc_test(
+    name = "model_building_test",
+    srcs = ["model_building_test.cc"],
+    deps = [
+        ":model_building",
+        "//tensorflow/lite:framework",
+        "//tensorflow/lite/c:c_api_types",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "subgraph_composite_inlining_test",
+    srcs = ["subgraph_composite_inlining_test.cc"],
+    deps = [
+        ":model_building",
+        ":subgraph",
+        "//tensorflow/lite:array",
+        "//tensorflow/lite:builtin_ops",
+        "//tensorflow/lite:framework",
+        "//tensorflow/lite:util",
+        "//tensorflow/lite/c:c_api_types",
+        "//tensorflow/lite/c:common",
+        "//tensorflow/lite/core/c:common",
+        "//tensorflow/lite/kernels:kernel_util",
+        "//tensorflow/lite/kernels:subgraph_test_util",
+        "//tensorflow/lite/kernels:test_util",
+        "//tensorflow/lite/kernels/internal:tensor_ctypes",
+        "//tensorflow/lite/schema:schema_fbs",
+        "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
     ],
 )

@@ -15,10 +15,19 @@ limitations under the License.
 
 #include "xla/hlo/transforms/expanders/qr_expander.h"
 
-#include <memory>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <numeric>
+#include <string>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "xla/hlo/builder/lib/arithmetic.h"
 #include "xla/hlo/builder/lib/constants.h"
 #include "xla/hlo/builder/lib/loops.h"
@@ -33,6 +42,7 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
 #include "xla/util.h"
+#include "xla/xla_data.pb.h"
 #include "tsl/platform/errors.h"
 
 namespace xla {
@@ -201,7 +211,7 @@ absl::StatusOr<QrDecomposition> QrExpander::QrBlock(
     XlaOp a, PrecisionConfig::Precision precision) {
   XlaBuilder* builder = a.builder();
   TF_ASSIGN_OR_RETURN(Shape a_shape, builder->GetShape(a));
-  const int num_dims = a_shape.rank();
+  const int num_dims = a_shape.dimensions_size();
   if (num_dims < 2) {
     return InvalidArgument("Argument to QR must have rank >= 2; got shape %s",
                            a_shape.ToString());
@@ -377,7 +387,7 @@ absl::StatusOr<XlaOp> QrExpander::BuildQrDecomposition(
     XlaOp a, int64_t block_size, PrecisionConfig::Precision precision) {
   XlaBuilder* builder = a.builder();
   TF_ASSIGN_OR_RETURN(Shape a_shape, builder->GetShape(a));
-  const int num_dims = a_shape.rank();
+  const int num_dims = a_shape.dimensions_size();
   if (num_dims < 2) {
     return InvalidArgument("Arguments to QR must have rank >= 2: got shape %s",
                            a_shape.ToString());
@@ -442,7 +452,7 @@ absl::StatusOr<XlaOp> QrExpander::ProductOfElementaryHouseholderReflectors(
   XlaBuilder* builder = a.builder();
   TF_ASSIGN_OR_RETURN(Shape a_shape, builder->GetShape(a));
   TF_ASSIGN_OR_RETURN(Shape taus_shape, builder->GetShape(taus));
-  const int num_dims = a_shape.rank();
+  const int num_dims = a_shape.dimensions_size();
   if (num_dims < 2) {
     return InvalidArgument("Arguments to QR must have rank >= 2: got shape %s",
                            a_shape.ToString());

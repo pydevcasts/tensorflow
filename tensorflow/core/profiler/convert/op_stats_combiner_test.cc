@@ -23,7 +23,7 @@ limitations under the License.
 #include "tensorflow/core/profiler/protobuf/hardware_types.pb.h"
 #include "tensorflow/core/profiler/protobuf/op_stats.pb.h"
 #include "tensorflow/core/profiler/protobuf/steps_db.pb.h"
-#include "tensorflow/core/profiler/utils/step_intersection.h"
+#include "xprof/utils/step_intersection.h"  // from @org_xprof
 
 namespace tensorflow {
 namespace profiler {
@@ -105,6 +105,18 @@ TEST(CombineAllOpStatsTest, CombinePerfEnvOrderZero) {
   };
   CombineAllOpStats(all_op_stats_info, dummy_step_intersection, &dst_op_stats2);
   EXPECT_EQ(100, dst_op_stats2.perf_env().peak_tera_flops_per_second());
+}
+
+TEST(CombineAllOpStatsTest, CombineRunEnvironmentWithMismatchHardwareType) {
+  OpStats coordinator_op_stats, device_op_stats, dst_op_stats;
+  coordinator_op_stats.mutable_run_environment()->set_hardware_type(
+      HardwareType::CPU_ONLY);
+  device_op_stats.mutable_run_environment()->set_hardware_type(
+      HardwareType::TPU);
+  CombineAllOpStats({OpStatsInfo(&coordinator_op_stats, CPU_ONLY, 0),
+                     OpStatsInfo(&device_op_stats, TPU, 1)},
+                    StepIntersection(1, {}), &dst_op_stats);
+  EXPECT_EQ(dst_op_stats.run_environment().hardware_type(), HardwareType::TPU);
 }
 
 }  // namespace

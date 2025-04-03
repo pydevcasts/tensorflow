@@ -29,7 +29,7 @@ limitations under the License.
 #include "xla/python/ifrt/sharding.h"
 #include "xla/python/pjrt_ifrt/xla_sharding.h"
 #include "xla/python/pjrt_ifrt/xla_sharding.pb.h"
-#include "tsl/platform/statusor.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace ifrt {
@@ -43,7 +43,8 @@ class HloShardingSerDes : public llvm::RTTIExtends<HloSharding, SerDes> {
     return "xla::ifrt::HloSharding";
   }
 
-  absl::StatusOr<std::string> Serialize(Serializable& serializable) override {
+  absl::StatusOr<std::string> Serialize(
+      Serializable& serializable, std::unique_ptr<SerializeOptions>) override {
     const HloSharding& sharding = llvm::cast<HloSharding>(serializable);
     HloShardingProto proto;
     *proto.mutable_devices() = sharding.devices()->ToProto();
@@ -65,10 +66,9 @@ class HloShardingSerDes : public llvm::RTTIExtends<HloSharding, SerDes> {
       return absl::InvalidArgumentError(
           "Failed to parse serialized HloSharding");
     }
-    TF_ASSIGN_OR_RETURN(
-        auto devices,
-        DeviceList::FromProto(deserialize_sharding_options->lookup_device,
-                              proto.devices()));
+    TF_ASSIGN_OR_RETURN(auto devices, DeviceList::FromProto(
+                                          deserialize_sharding_options->client,
+                                          proto.devices()));
     MemoryKind memory_kind;
     if (proto.has_memory_kind()) {
       memory_kind = MemoryKind(proto.memory_kind());

@@ -17,16 +17,14 @@
 
 #include <vector>
 
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
+#include "tensorflow/lite/experimental/litert/cc/litert_expected.h"
 
-namespace litert {
-namespace qnn {
+namespace litert::qnn {
 
 template <typename H, typename V>
 class Registry {
  public:
-  absl::StatusOr<H> Register(const V& value) {
+  Expected<H> Register(const V& value) {
     // TODO: improve this linear search by keeping an index to the first unused
     // element.
     for (auto i = 0; i < entries_.size(); ++i) {
@@ -43,17 +41,17 @@ class Registry {
     return handle;
   }
 
-  absl::Status Unregister(H handle) {
+  Expected<void> Unregister(H handle) {
     if (handle < 0 || handle >= entries_.size()) {
-      return absl::NotFoundError("Unexpected handle");
+      return Unexpected(kLiteRtStatusErrorNotFound, "Unexpected handle");
     }
     entries_[handle].used = false;
     return {};
   }
 
-  absl::StatusOr<V*> Get(H handle) {
+  Expected<V*> Get(H handle) {
     if (handle < 0 || handle >= entries_.size()) {
-      return absl::NotFoundError("Unexpected handle");
+      return Unexpected(kLiteRtStatusErrorNotFound, "Unexpected handle");
     }
     return &entries_[handle].value;
   }
@@ -68,7 +66,6 @@ class Registry {
   std::vector<Entry> entries_;
 };
 
-}  // namespace qnn
-}  // namespace litert
+}  // namespace litert::qnn
 
 #endif  // TENSORFLOW_LITE_EXPERIMENTAL_LITERT_VENDORS_QUALCOMM_DISPATCH_REGISTRY_H_

@@ -1,8 +1,8 @@
 # Tools and utilities that aid in XLA development and usage.
 
-load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("//xla:py_strict.bzl", "py_strict_binary", "py_strict_library")
 load(
-    "//xla:xla.bzl",
+    "//xla:xla.default.bzl",
     "xla_cc_binary",
 )
 load("//xla/tsl:tsl.default.bzl", "filegroup")
@@ -23,13 +23,6 @@ filegroup(
     visibility = ["//xla:internal"],
 )
 
-build_test(
-    name = "hex_floats_to_packed_literal_build_test",
-    targets = [
-        ":hex_floats_to_packed_literal",
-    ],
-)
-
 xla_cc_binary(
     name = "hex_floats_to_packed_literal",
     srcs = ["hex_floats_to_packed_literal.cc"],
@@ -43,13 +36,6 @@ xla_cc_binary(
         "@local_tsl//tsl/platform:logging",
         "@local_tsl//tsl/platform:platform_port",
         "@local_tsl//tsl/platform:status",
-    ],
-)
-
-build_test(
-    name = "show_literal_build_test",
-    targets = [
-        ":show_literal",
     ],
 )
 
@@ -67,13 +53,6 @@ xla_cc_binary(
     ],
 )
 
-build_test(
-    name = "convert_computation_build_test",
-    targets = [
-        ":convert_computation",
-    ],
-)
-
 xla_cc_binary(
     name = "convert_computation",
     srcs = ["convert_computation.cc"],
@@ -84,13 +63,6 @@ xla_cc_binary(
         "@local_tsl//tsl/platform:platform_port",
         "@local_tsl//tsl/platform:protobuf",
         "@local_tsl//tsl/platform:status",
-    ],
-)
-
-build_test(
-    name = "hlo_module_metadata_processor_build_test",
-    targets = [
-        ":hlo_module_metadata_processor",
     ],
 )
 
@@ -110,13 +82,6 @@ xla_cc_binary(
     ],
 )
 
-build_test(
-    name = "show_text_literal_build_test",
-    targets = [
-        ":show_text_literal",
-    ],
-)
-
 xla_cc_binary(
     name = "show_text_literal",
     srcs = ["show_text_literal.cc"],
@@ -129,13 +94,6 @@ xla_cc_binary(
         "@local_tsl//tsl/platform:logging",
         "@local_tsl//tsl/platform:platform_port",
         "@local_tsl//tsl/platform:protobuf",
-    ],
-)
-
-build_test(
-    name = "hlo_proto_to_json_build_test",
-    targets = [
-        ":hlo_proto_to_json",
     ],
 )
 
@@ -152,4 +110,54 @@ xla_cc_binary(
         "@local_tsl//tsl/platform:platform_port",
         "@local_tsl//tsl/platform:status",
     ],
+)
+
+xla_cc_binary(
+    name = "hlo-translate",
+    testonly = True,
+    srcs = ["hlo_translate.cc"],
+    deps = [
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/parser:hlo_parser",
+        "//xla/hlo/translate:stablehlo",
+        "//xla/hlo/translate/hlo_to_mhlo:hlo_to_mlir_hlo",
+        "//xla/mlir_hlo:mhlo_passes",
+        "//xla/service:hlo_proto_cc",
+        "//xla/service:hlo_proto_util",
+        "//xla/service/cpu:cpu_compiler",
+        "//xla/service/cpu:cpu_transfer_manager",
+        "//xla/service/llvm_ir:llvm_util",
+        "//xla/stream_executor/host:host_platform",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:string_view",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Parser",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TranslateLib",
+        "@local_tsl//tsl/platform:protobuf",
+        "@stablehlo//:stablehlo_passes",
+    ],
+)
+
+xla_cc_binary(
+    name = "hlo-opt",
+    testonly = True,
+    linkopts = ["-Wl,-rpath,$$ORIGIN/../lit_lib"],
+    deps = [
+        "//xla/hlo/tools/hlo_opt:opt_main",
+    ],
+)
+
+py_strict_library(
+    name = "generate_hlo_test_checks_lib",
+    srcs = ["generate_hlo_test_checks.py"],
+)
+
+py_strict_binary(
+    name = "generate_hlo_test_checks",
+    srcs = ["generate_hlo_test_checks.py"],
 )

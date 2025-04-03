@@ -29,6 +29,7 @@ limitations under the License.
 #include "xla/stream_executor/tpu/c_api_conversions.h"
 #include "xla/stream_executor/tpu/c_api_decl.h"
 #include "xla/stream_executor/tpu/tpu_executor_api.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -37,7 +38,6 @@ limitations under the License.
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/platform/status.h"
-#include "tsl/platform/statusor.h"
 
 namespace tensorflow {
 
@@ -60,8 +60,8 @@ xla::Shape GetTPUInfeedLayout(const xla::Shape& shape) {
 // Updates the layout of the given infeed shape, optionally considering the
 // sharding of the op. If the op has tile sharding, assign the layout based on
 // the shard shape.
-Status UpdateInfeedLayout(xla::Shape* shape,
-                          std::optional<xla::OpSharding> sharding) {
+absl::Status UpdateInfeedLayout(xla::Shape* shape,
+                                std::optional<xla::OpSharding> sharding) {
   if (sharding && sharding->type() == xla::OpSharding::OTHER) {
     TF_ASSIGN_OR_RETURN(auto hlo_sharding,
                         xla::HloSharding::FromProto(*sharding));

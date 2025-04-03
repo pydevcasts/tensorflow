@@ -20,11 +20,9 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
-#include "mhlo/transforms/passes.h"
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -32,50 +30,59 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LLVM.h"
 #include "shardy/common/file_utils.h"
 #include "shardy/dialect/sdy/transforms/propagation/passes.h"
+#include "re2/re2.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_input_output_alias_config.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/transforms/simplifiers/hlo_dce.h"
 #include "xla/hlo/transforms/simplifiers/tuple_simplifier.h"
-#include "xla/hlo/translate/hlo_to_mhlo/hlo_to_mlir_hlo.h"
-#include "xla/hlo/translate/mhlo_to_hlo/mlir_hlo_to_hlo.h"
+#include "xla/hlo/translate/stablehlo.h"
 #include "xla/hlo/utils/hlo_sharding_util.h"
 #include "xla/layout.h"
 #include "xla/map_util.h"
-#include "xla/mlir_hlo/mhlo/transforms/passes.h"
 #include "xla/service/computation_layout.h"
 #include "xla/service/hlo.pb.h"
-#include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/service/spmd/shardy/constants.h"
-#include "xla/service/spmd/shardy/mhlo_round_trip/mhlo_export.h"
-#include "xla/service/spmd/shardy/mhlo_round_trip/mhlo_import.h"
 #include "xla/service/spmd/shardy/sdy_round_trip/pipelines.h"
+#include "xla/service/spmd/shardy/stablehlo_round_trip/stablehlo_export.h"
+#include "xla/service/spmd/shardy/stablehlo_round_trip/stablehlo_import.h"
 #include "xla/service/spmd/shardy/utils.h"
 #include "xla/shape.h"
 #include "xla/shape_layout.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/framework/mlir/status_scoped_diagnostic_handler.h"
+#include "xla/tsl/platform/env.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/errors.h"
 #include "tsl/platform/path.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace sdy {
 
 namespace {
+
+std::string uniqueModuleName(const HloModule& module) {
+  std::string result;
+  absl::StrAppendFormat(&result, "module_%04d", module.unique_id());
+  if (!module.name().empty()) {
+    absl::StrAppend(&result, ".", module.name());
+  }
+  return result;
+}
 
 // Creates a vector of HloComputation, which is used to replace the old
 // computations in the HloModule. It is adapted from CreateAndSanitizeFromProto
@@ -164,9 +171,6 @@ Shape getFlattenedShape(const Shape& shape) {
       shape, [&](const Shape& subShape, const ShapeIndex& index) {
         flattenedShapes.push_back(subShape);
       });
-  if (flattenedShapes.empty()) {
-    return Shape();
-  }
   return ShapeUtil::MakeMaybeTupleShape(flattenedShapes);
 }
 
@@ -297,34 +301,38 @@ absl::StatusOr<bool> ShardyXLA::Run(
     const absl::flat_hash_set<absl::string_view>& executionThreads) {
   LOG(INFO) << "Using Shardy for XLA SPMD propagation.";
 
-  // HLO -> MLIR MHLO
+  // HLO -> StableHLO
   auto mlirContext = std::make_unique<mlir::MLIRContext>();
   loadAllRequiredDialects(mlirContext.get());
-  mlir::OwningOpRef<mlir::ModuleOp> mlirModule =
-      xla::llvm_ir::CreateMlirModuleOp(
-          mlir::UnknownLoc::get(mlirContext.get()));
-  TF_RETURN_IF_ERROR(
-      ConvertHloToMlirHlo(*mlirModule, hloModule,
-                          /*import_all_computations=*/false,
-                          /*flatten_computation_args_result=*/true));
+  TF_ASSIGN_OR_RETURN(
+      mlir::OwningOpRef<mlir::ModuleOp> mlirModule,
+      xla::ConvertHloToStablehlo(*mlirContext.get(), hloModule));
 
-  std::string shardyDir = hloModule->config().debug_options().xla_dump_to();
+  const DebugOptions& debugOptions = hloModule->config().debug_options();
+  std::string shardyDir = debugOptions.xla_dump_to();
+
+  if (!shardyDir.empty() &&
+      !RE2::PartialMatch(name(), debugOptions.xla_dump_hlo_pass_re())) {
+    shardyDir.clear();
+  }
 
   if (shardyDir == "sponge") {
     shardyDir = getenv("TEST_UNDECLARED_OUTPUTS_DIR");
     if (shardyDir.empty()) {
       LOG(WARNING) << "\"sponge\" specified as dump directory but "
                       "TEST_UNDECLARED_OUTPUTS_DIR is not set!";
+    } else {
+      LOG(INFO) << "Shardy dump directory is sponge on undeclared outputs dir: "
+                << shardyDir;
     }
   }
 
   if (!shardyDir.empty()) {
     shardyDir =
-        tsl::io::JoinPath(shardyDir, "shardy",
-                          std::string_view(mlirModule->getName().value_or("")));
+        tsl::io::JoinPath(shardyDir, "shardy", uniqueModuleName(*hloModule));
     LOG(INFO) << "Using Shardy output directory: " << shardyDir;
   }
-
+  TF_RETURN_IF_ERROR(tsl::Env::Default()->RecursivelyCreateDir(shardyDir));
   // MLIR pipeline: (1) import, (2) Shardy, and (3) export.
 
   bool enableVerifier = false;
@@ -349,7 +357,7 @@ absl::StatusOr<bool> ShardyXLA::Run(
       return mlir::ArrayRef<bool>(span.data(), span.size());
     };
 
-    addMhloImportPipeline(
+    addStablehloImportPipeline(
         pm,
         spanToArrayRef(hloModule->config()
                            .allow_spmd_sharding_propagation_to_parameters()),
@@ -378,27 +386,23 @@ absl::StatusOr<bool> ShardyXLA::Run(
                                      useTupleArgs);
 
   if (runSdyShardingPropagation) {
-    // Shardy is currently operating on stablehlo, since this is what JAX
-    // emits. Long term shardy will be fully dialect agnostic, and both mhlo
-    // and stablehlo can register their ops for sdy propagation.
-    pm.addPass(mlir::mhlo::createHloLegalizeToStablehloPass());
     // NOTE: if we are using auto-spmd, we will use conservative propagation
     // since the TOAST cost model cannot account for split axes or padding.
-    mlir::sdy::addPropagationPipeline(
-        pm, shardyDir,
-        /*conservativePropagation=*/hloModule->use_auto_spmd_partitioning());
-    pm.addPass(mlir::mhlo::createStablehloLegalizeToHloPass());
+    mlir::sdy::PropagationOptions options = defaultOptions;
+    options.dumpDirectory = shardyDir;
+    options.conservativePropagation = hloModule->use_auto_spmd_partitioning();
+    mlir::sdy::addPropagationPipeline(pm, options);
   }
-  addMhloExportPipeline(pm);
+  addStablehloExportPipeline(pm);
   pm.addPass(mlir::sdy::createSaveModuleOpPass(shardyDir,
                                                "sdy_module_after_xla_export"));
   tsl::StatusScopedDiagnosticHandler diagnosticHandler(mlirContext.get());
   TF_RETURN_IF_ERROR(diagnosticHandler.consumeStatus(pm.run(*mlirModule)));
 
-  // MLIR MHLO -> HLO
+  // StableHlo -> HLO
   HloProto hloProto;
-  TF_RETURN_IF_ERROR(ConvertMlirHloToHlo(*mlirModule, &hloProto, useTupleArgs,
-                                         /*return_tuple=*/false));
+  TF_RETURN_IF_ERROR(ConvertStablehloWithManyArgsToHloProto(
+      *mlirModule, &hloProto, useTupleArgs));
   TF_RETURN_IF_ERROR(
       createFromProtoAndReplaceComputations(hloModule, hloProto.hlo_module()));
 
@@ -419,8 +423,8 @@ absl::StatusOr<bool> ShardyXLA::Run(
   // update_parameters_layout.
   TF_RETURN_IF_ERROR(
       hlo_sharding_util::CanonicalizeLayoutAfterShardingPropagation(
-          hloModule, /*update_output_layout=*/true,
-          /*update_parameters_layout=*/true));
+          hloModule, /*update_output_layout=*/{true},
+          /*update_parameters_layout=*/{true}));
 
   // We don't fully replace the HLO module, so it will continue to have the
   // temporary frontend attributes. So clean them up as XLA won't need them.

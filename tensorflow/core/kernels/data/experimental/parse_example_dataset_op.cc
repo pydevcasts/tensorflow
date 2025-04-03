@@ -12,7 +12,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include <cstddef>
+#include <cstdint>
 #include <deque>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/data/dataset_utils.h"
@@ -303,7 +310,7 @@ class ParseExampleDatasetOp : public UnaryDatasetOpKernel {
         dense_defaults_nodes.emplace_back(node);
       }
 
-      std::vector<std::pair<StringPiece, AttrValue>> attrs;
+      std::vector<std::pair<absl::string_view, AttrValue>> attrs;
 
       AttrValue sparse_keys_attr;
       b->BuildAttrValue(sparse_keys_, &sparse_keys_attr);

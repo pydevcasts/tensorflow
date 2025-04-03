@@ -44,7 +44,9 @@ namespace {
 bool IsSupportedComposite(::mlir::stablehlo::CompositeOp op) {
   // List of supported composites to represent using CustomOp.
   return llvm::is_contained(
-      {"odml.update_kv_cache", "odml.update_external_kv_cache"}, op.getName());
+      {"odml.update_kv_cache", "odml.update_external_kv_cache",
+       "odml.quantize_and_dequantize", "odml.detector"},
+      op.getName());
 }
 
 bool IsKVCacheCompositeOp(::mlir::stablehlo::CompositeOp op) {
@@ -69,6 +71,12 @@ LogicalResult BuildOption(flexbuffers::Builder* fbb, Operation* op,
 
   if (mlir::isa<::mlir::FloatAttr>(attr)) {
     fbb->Double(key, mlir::dyn_cast<mlir::FloatAttr>(attr).getValueAsDouble());
+    return success();
+  }
+
+  if (mlir::isa<::mlir::StringAttr>(attr)) {
+    fbb->String(
+        key, mlir::dyn_cast<mlir::StringAttr>(attr).getValue().str().c_str());
     return success();
   }
 

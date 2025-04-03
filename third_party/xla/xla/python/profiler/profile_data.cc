@@ -23,9 +23,12 @@ limitations under the License.
 #include <memory>
 #include <string>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/logging.h"
 #include "tsl/platform/status.h"
+#include "tsl/profiler/protobuf/xplane.pb.h"
 
 namespace tensorflow::profiler::python {
 

@@ -26,13 +26,41 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/transforms/expanders/bitcast_dtypes_expander.h"
+#include "xla/service/all_reduce_simplifier.h"
+#include "xla/service/all_to_all_decomposer.h"
+#include "xla/service/batched_gather_scatter_normalizer.h"
+#include "xla/service/call_inliner.h"
 #include "xla/service/compiler.h"
+#include "xla/service/conditional_simplifier.h"
+#include "xla/service/conditional_to_select.h"
+#include "xla/service/copy_insertion.h"
 #include "xla/service/executable.h"
+#include "xla/service/gather_expander.h"
+#include "xla/service/gpu/transforms/all_gather_dynamic_slice_simplifier.h"
+#include "xla/service/gpu/transforms/all_reduce_splitter.h"
+#include "xla/service/gpu/transforms/collective_permute_valid_iteration_annotator.h"
+#include "xla/service/gpu/transforms/scatter_expander.h"
+#include "xla/service/gpu/transforms/scatter_slice_simplifier.h"
+#include "xla/service/map_inliner.h"
 #include "xla/service/platform_util.h"
+#include "xla/service/reduce_scatter_reassociate.h"
+#include "xla/service/scatter_determinism_expander.h"
+#include "xla/service/scatter_simplifier.h"
+#include "xla/service/select_and_scatter_expander.h"
+#include "xla/service/sharding_remover.h"
+#include "xla/service/spmd/sharding_format_picker.h"
+#include "xla/service/spmd/shardy/shardy_xla_pass.h"
+#include "xla/service/topk_rewriter.h"
+#include "xla/service/triangular_solve_expander.h"
+#include "xla/service/while_loop_all_reduce_code_motion.h"
+#include "xla/service/while_loop_constant_sinking.h"
+#include "xla/service/while_loop_invariant_code_motion.h"
+#include "xla/service/while_loop_simplifier.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/xla.pb.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 
@@ -69,11 +97,12 @@ absl::StatusOr<std::optional<std::string>> CompiledOptProvider::GenerateStage(
   return std::nullopt;
 }
 
-absl::StatusOr<Compiler*> CompiledOptProvider::GetCompiler() {
+absl::StatusOr<std::unique_ptr<Compiler>> CompiledOptProvider::GetCompiler() {
   TF_ASSIGN_OR_RETURN(se::Platform * platform,
                       PlatformUtil::GetPlatform(GetPlatformName()));
 
-  TF_ASSIGN_OR_RETURN(Compiler * compiler, Compiler::GetForPlatform(platform));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<Compiler> compiler,
+                      Compiler::GetForPlatform(platform));
   return compiler;
 }
 
@@ -83,7 +112,7 @@ absl::StatusOr<std::unique_ptr<HloModule>> CompiledOptProvider::GetOptimizedHlo(
 
   DebugOptions debug_opts = GetDebugOptionsFromFlags();
   Compiler::CompileOptions opts;
-  TF_ASSIGN_OR_RETURN(Compiler * compiler, GetCompiler());
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<Compiler> compiler, GetCompiler());
   DebugOptions d = input_module->config().debug_options();
   d.set_xla_embed_ir_in_executable(true);
   input_module->mutable_config().set_debug_options(d);
@@ -106,7 +135,7 @@ absl::StatusOr<std::unique_ptr<Executable>> CompiledOptProvider::GetExecutable(
   TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> optimized_module,
                       GetOptimizedHlo(std::move(input_module)));
   TF_ASSIGN_OR_RETURN(se::StreamExecutor * executor, GetExecutor());
-  TF_ASSIGN_OR_RETURN(Compiler * compiler, GetCompiler());
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<Compiler> compiler, GetCompiler());
   TF_ASSIGN_OR_RETURN(
       std::unique_ptr<Executable> executable,
       compiler->RunBackend(std::move(optimized_module), executor, opts));
@@ -115,6 +144,48 @@ absl::StatusOr<std::unique_ptr<Executable>> CompiledOptProvider::GetExecutable(
 
 std::set<std::string> CompiledOptProvider::SupportedStages() {
   return {"hlo", "html", "hlo-backend"};
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Registration of Hardware-specific HLO Passes Common to GPU, CPU.           //
+////////////////////////////////////////////////////////////////////////////////
+void CompiledOptProvider::RegisterSharedHardwareSpecificPasses() {
+  // go/keep-sorted start
+  RegisterPass<AllGatherDynamicSliceSimplifier>();
+  RegisterPass<AllReduceSimplifier>();
+  RegisterPass<AllReduceSplitter>();
+  RegisterPass<AllToAllDecomposer>();
+  RegisterPass<BatchedGatherScatterNormalizer>();
+  RegisterPass<BitcastDtypesExpander>();
+  RegisterPass<CallInliner>();
+  RegisterPass<CollectivePermuteValidIterationAnnotator>();
+  RegisterPass<ConditionalSimplifier>();
+  RegisterPass<ConditionalToSelect>();
+  RegisterPass<CopyInsertion>();
+  RegisterPass<GatherExpander>(GatherExpander::kEliminateSimpleGathers);
+  RegisterPass<GpuScatterExpander>();
+  RegisterPass<MapInliner>();
+  RegisterPass<ReduceScatterReassociate>();
+  RegisterPass<ScatterDeterminismExpander>();
+  RegisterPass<ScatterSimplifier>();
+  RegisterPass<ScatterSliceSimplifier>();
+  RegisterPass<SelectAndScatterExpander>();
+  RegisterPass<ShardingRemover>();
+  RegisterPass<TopkDecomposer>();
+  RegisterPass<TriangularSolveExpander>();
+  RegisterPass<WhileLoopAllReduceCodeMotion>();
+  RegisterPass<WhileLoopConstantSinking>();
+  RegisterPass<WhileLoopInvariantCodeMotion>();
+  RegisterPass<WhileLoopSimplifier>();
+  RegisterPass<sdy::ShardyXLA>();
+  // go/keep-sorted end
+
+  // Test-only passes exposing behavior that isn't easily testable through
+  // standard passes, e.g. internal or config-dependent behavior.
+  // go/keep-sorted start
+  RegisterPass<test_only::ShardingFormatPicker>(
+      test_only::ShardingFormatPicker::ShardingType::kBestEffortV2);
+  // go/keep-sorted end
 }
 
 }  // namespace xla

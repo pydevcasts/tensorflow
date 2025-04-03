@@ -18,7 +18,6 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <string_view>
 #include <utility>
 
 #include "absl/log/check.h"
@@ -75,7 +74,7 @@ OpDynamismSupport OpHasDynamismSupport(HloInstruction* hlo) {
   return OpDynamismSupport::kNoSupport;
 }
 
-absl::Status CustomCallDynamicDimensionInference(
+bool CustomCallDynamicDimensionInference(
     HloInstruction* hlo, DynamicDimensionInference* inferencer) {
   if (hlo->custom_call_target() == "OpWithDynamicLowering") {
     if (hlo->shape().IsTuple()) {
@@ -83,15 +82,17 @@ absl::Status CustomCallDynamicDimensionInference(
       HloInstruction* dynamic_size =
           inferencer->GetDynamicSize(hlo->mutable_operand(0), {1}, 0);
       inferencer->SetDynamicSize(hlo, {1}, 0, dynamic_size);
+      return true;
     } else {
       // Use the operand's dynamic size as output dynamic size.
       HloInstruction* dynamic_size =
           inferencer->GetDynamicSize(hlo->mutable_operand(0), {}, 0);
       inferencer->SetDynamicSize(hlo, {}, 0, dynamic_size);
+      return true;
     }
   }
 
-  return absl::OkStatus();
+  return false;
 }
 
 class DynamicPadderTest : public HloTestBase {
@@ -686,7 +687,7 @@ ENTRY main {
   };
   auto custom_call_handler = [](HloInstruction* hlo,
                                 DynamicDimensionInference* inference) {
-    return absl::OkStatus();
+    return false;
   };
   TF_ASSERT_OK(
       RunPadder(
@@ -2392,7 +2393,7 @@ ENTRY gds {
 }
 
 TEST_F(DynamicPadderTest, ShardingDynamicShapes) {
-  constexpr std::string_view hlo = R"(
+  constexpr absl::string_view hlo = R"(
 HloModule main
 
 ENTRY main {

@@ -41,6 +41,7 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tf2xla/internal/logging_hooks.h"
 #include "tensorflow/compiler/mlir/tf2xla/internal/passes/clustering_passes.h"
 #include "xla/tsl/framework/device_type.h"
+#include "xla/tsl/platform/errors.h"
 #include "tensorflow/core/framework/metrics.h"
 #include "tensorflow/core/platform/errors.h"
 #include "tensorflow/core/platform/stacktrace.h"
@@ -48,7 +49,6 @@ limitations under the License.
 #include "tensorflow/core/tpu/tpu_defs.h"
 #include "tensorflow/core/util/debug_data_dumper.h"
 #include "tsl/platform/error_logging.h"
-#include "tsl/platform/errors.h"
 
 namespace tensorflow {
 namespace tf2xla {
@@ -86,7 +86,7 @@ void CreateReplicatedBridgePipelineV1(OpPassManager &pm) {
 
 // Run the TF XLA Bridge based on the input pipeline, which can be either TPU
 // bridge pipeline or non TPU bridge pipeline.
-tensorflow::Status RunTFXLABridge(
+absl::Status RunTFXLABridge(
     ModuleOp module,
     llvm::function_ref<void(OpPassManager &pm)> pipeline_builder,
     llvm::StringRef module_name = llvm::StringRef(),
@@ -144,9 +144,9 @@ tensorflow::Status RunTFXLABridge(
 
 }  // namespace
 
-tensorflow::Status RecordStatusIfError(const std::string error_prefix,
-                                       bool is_in_fallback_enabled_mode,
-                                       absl::Status status) {
+absl::Status RecordStatusIfError(const std::string error_prefix,
+                                 bool is_in_fallback_enabled_mode,
+                                 absl::Status status) {
   if (status.ok()) {
     return status;
   }
@@ -205,14 +205,14 @@ absl::Status RunClusteringPipelineOnSubmodule(
   return absl::OkStatus();
 }
 
-tensorflow::Status RunSessionTf2xlaClusteringBridge(
+absl::Status RunSessionTf2xlaClusteringBridge(
     ModuleOp module, bool is_in_fallback_enabled_mode) {
   VLOG(2) << "TPU Sessions Bridge called stack trace is "
           << "(NOTE: this is not an error; rather the stack trace for "
              "debugging) : "
           << tensorflow::CurrentStackTrace();
 
-  Status functional_import_status = RunTFXLABridge(
+  absl::Status functional_import_status = RunTFXLABridge(
       module, [](OpPassManager &pm) { CreateReplicatedBridgePipelineV1(pm); },
       /*module_name=*/"", /*dump_prefix=*/"tf_xla_functional_import_bridge_v1");
   TF_RETURN_IF_ERROR(RecordStatusIfError(

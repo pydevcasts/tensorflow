@@ -12,20 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <fstream>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/strings/str_format.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/CommandLine.h"
-#include "tensorflow/lite/experimental/litert/core/byte_code_util.h"
+#include "tensorflow/lite/experimental/litert/compiler/plugin/compiler_flags.h"
 #include "tensorflow/lite/experimental/litert/tools/apply_plugin.h"
+#include "tensorflow/lite/experimental/litert/tools/outstream.h"
 
-using ::litert::internal::Serialization;
 using ::litert::tools::ApplyPlugin;
 using ::litert::tools::ApplyPluginRun;
+using ::litert::tools::UserStream;
 
 // NOLINTNEXTLINE
 static llvm::cl::opt<std::string> cmd(
@@ -59,25 +61,40 @@ static llvm::cl::list<std::string> libs(
     llvm::cl::list_init(llvm::ArrayRef<std::string>{
         "third_party/tensorflow/lite/experimental/litert/vendors/examples",
         "third_party/tensorflow/lite/experimental/litert/vendors/qualcomm/"
-        "compiler"}));
+        "compiler",
+        "third_party/tensorflow/lite/experimental/litert/vendors/mediatek/"
+        "compiler",
+        "third_party/tensorflow/lite/experimental/litert/vendors/"
+        "google_tensor/compiler"}));
 
 // NOLINTNEXTLINE
-static llvm::cl::opt<std::string> out(
+static llvm::cl::list<std::string> outs(
     "o",
-    llvm::cl::desc("Path to file for output, \"-\" indicates standard out."),
-    llvm::cl::init("-"));
+    llvm::cl::desc("Path to files for output, \"-\" indicates standard out, "
+                   "\"--\" for standard err, \"none\" for null stream."),
+    llvm::cl::list_init(llvm::ArrayRef<std::string>{"-"}));
 
 // NOLINTNEXTLINE
 static llvm::cl::opt<std::string> err(
     "err",
-    llvm::cl::desc("Path to file for error output, \"-\" indicates stdandard "
-                   "error and \"none\" indicates silent."),
-    llvm::cl::init("-"));
+    llvm::cl::desc("Path to file for err output, \"-\" indicates standard out, "
+                   "\"--\" for standard err, \"none\" for null stream."),
+    llvm::cl::init("--"));
 
 // NOLINTNEXTLINE
-static llvm::cl::opt<std::string> serialization(
-    "serialization", llvm::cl::desc("Serialization strategy to use."),
-    llvm::cl::init("METADATA"));
+static llvm::cl::opt<std::string> compiler_flags(
+    "compiler-flags",
+    llvm::cl::desc("List of comma separated (no space) compiler flags. Flags "
+                   "may be key-value pairs "
+                   "in the format of \"key=value\", or just \"key\". E.g. "
+                   "\"--compiler-flags=key1=value1,key2\""));
+
+// NOLINTNEXTLINE
+static llvm::cl::list<uint32_t> subgraphs(
+    "subgraphs",
+    llvm::cl::desc("If provides, only the subgraphs with the given indices "
+                   "are applied with the plugin."),
+    llvm::cl::list_init(llvm::ArrayRef<uint32_t>{}));
 
 ApplyPluginRun::Ptr ParseFlags() {
   auto res = std::make_unique<ApplyPluginRun>();
@@ -85,6 +102,8 @@ ApplyPluginRun::Ptr ParseFlags() {
   if (!model.empty()) {
     res->model = model;
   }
+
+  res->compiler_flags = *litert::internal::ParseCompilerFlags(compiler_flags);
 
   res->soc_manufacturer = soc_manufacturer;
   res->soc_models.push_back(soc_model);
@@ -101,14 +120,12 @@ ApplyPluginRun::Ptr ParseFlags() {
     res->cmd = ApplyPluginRun::Cmd::INFO;
   } else if (cmd == "noop") {
     res->cmd = ApplyPluginRun::Cmd::NOOP;
+  } else {
+    return nullptr;
   }
 
-  if (serialization == "METADATA") {
-    res->serialization = Serialization::kMetadata;
-  } else if (serialization == "APPEND") {
-    res->serialization = Serialization::kAppend;
-  } else {
-    res->serialization = Serialization::kUnknown;
+  for (auto subgraph_idx : subgraphs) {
+    res->subgraphs.insert(subgraph_idx);
   }
 
   return res;
@@ -122,18 +139,19 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  std::ofstream file_out;
-  if (out != "-") {
-    file_out.open(out);
-    run->outs.clear();
-    run->outs.push_back(file_out);
+  run->outs.clear();
+  std::vector<std::unique_ptr<litert::tools::UserStream>> oss;
+  for (const auto& out : outs) {
+    oss.push_back(std::make_unique<litert::tools::UserStream>(
+        UserStream::MakeFromFlag(out)));
+    run->outs.push_back(oss.back()->Get());
   }
 
-  std::ofstream file_err;
-  if (err != "-") {
-    file_err.open(err);
-    run->dump_out.emplace(file_err);
-  }
+  run->dump_out = UserStream::MakeFromFlag(err);
+
+  run->dump_out.Get() << absl::StreamFormat(
+      "CMD: %s\nMODEL: %s\nSOC_MANUFACTURER: %s\nSOC_MODEL: %s\n", cmd, model,
+      soc_manufacturer, soc_model);
 
   return ApplyPlugin(std::move(run));
 }

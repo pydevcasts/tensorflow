@@ -141,7 +141,7 @@ class Subgraph {
                                        allocation, sparsity, buffer_identifier);
   }
   TfLiteStatus SetTensorParametersReadOnly(
-      int tensor_index, TfLiteType type, const char* name, const size_t ndims,
+      int tensor_index, TfLiteType type, const char* name, size_t ndims,
       const int* dims, TfLiteQuantization quantization, const char* buffer,
       size_t bytes, const Allocation* allocation = nullptr,
       TfLiteSparsity* sparsity = nullptr,
@@ -165,9 +165,9 @@ class Subgraph {
         is_variable, dims_signature.size(), dims_signature.data());
   }
   TfLiteStatus SetTensorParametersReadWrite(
-      int tensor_index, TfLiteType type, const char* name, const size_t ndims,
+      int tensor_index, TfLiteType type, const char* name, size_t ndims,
       const int* dims, TfLiteQuantization quantization,
-      bool is_variable = false, const size_t ndims_signature = 0,
+      bool is_variable = false, size_t ndims_signature = 0,
       const int* dims_signature = nullptr);
 
   // Get all tensors in the subgraph.
@@ -597,6 +597,22 @@ class Subgraph {
     return tensor_buffer_identifiers_;
   }
 
+  // Replaces the node for the given execution index with the subgraph.
+  //
+  // - The node and subgraph tensor counts must match.
+  // - The subgraph index must be valid for the current interpreter object.
+  //
+  // The `last_inserted_execution_index` is updated to be the execution index of
+  // the last node inserted in the execution plan (i.e. execution_index +
+  // subgraph_execution_plan_size - 1).
+  TfLiteStatus ReplaceNodeWithSubgraph(int execution_index,
+                                       const TfLiteNode& node,
+                                       int subgraph_index,
+                                       int& last_inserted_execution_index);
+
+  // Inlines the composite nodes that have not been taken by a delegate.
+  TfLiteStatus InlineCompositeNodes();
+
  private:
 #ifndef DOXYGEN_SKIP
   friend class tflite::impl::InterpreterBuilder;
@@ -901,13 +917,18 @@ class Subgraph {
   // Ensures the memory required is planned and allocated.
   TfLiteStatus EnsureMemoryAllocations();
 
+  enum class InliningStrategy { kNoAutoInline, kAutoInline };
+  // Private version of AllocateTensors that allows disabling auto-inlining of
+  // subgraphs.
+  TfLiteStatus AllocateTensors(InliningStrategy auto_inline);
+
   // Enables cancellation of in flight invocation with `Cancel` call.
   // Should only be called by the interpreter when building the subgraph.
   // `flag` should be nullptr otherwise cancellation is disabled.
   TfLiteStatus EnableCancellation(std::atomic_flag* flag);
 
   // Attempts to cancel in flight invocation if any.
-  // This will not affect `Invoke`s that happends after the cancellation.
+  // This will not affect `Invoke`s that happen after the cancellation.
   // Non blocking. Thread safe.
   // Returns kTfLiteError if cancellation is not enabled, otherwise returns
   // kTfLiteOk.
@@ -980,6 +1001,7 @@ class Subgraph {
     // tensors.
     kStateInvokableAndImmutable,
   };
+
   State state_ = kStateUninvokable;
 
   // A pure C data structure used to communicate with the pure C plugin

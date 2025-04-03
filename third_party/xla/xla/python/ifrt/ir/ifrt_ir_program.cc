@@ -26,17 +26,21 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "llvm/Support/Casting.h"
+#include "xla/pjrt/compile_options.pb.h"
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/python/ifrt/compiler.h"
 #include "xla/python/ifrt/device.h"
 #include "xla/python/ifrt/executable.h"
+#include "xla/python/ifrt/ir/ifrt_ir_compile_options.pb.h"
 #include "xla/python/pjrt_ifrt/xla_compiler.h"
-#include "tsl/platform/statusor.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace ifrt {
 
 char IfrtIRProgram::ID = 0;
+char SerializeIfrtIRProgramOptions::ID = 0;
+char DeserializeIfrtIRProgramOptions::ID = 0;
 char IfrtIRCompileOptions::ID = 0;
 
 absl::StatusOr<std::unique_ptr<IfrtIRCompileOptions>> GetIfrtIRCompileOptions(
@@ -75,26 +79,25 @@ IfrtIRCompileOptions::FromProto(const IfrtIrCompileOptionsProto& proto) {
 absl::StatusOr<IfrtIrCompileOptionsProto> IfrtIRCompileOptions::ToProto()
     const {
   IfrtIrCompileOptionsProto proto;
-
   proto.mutable_device_ids()->Reserve(device_assignments.size());
   for (const DeviceId& device_id : device_assignments) {
     proto.add_device_ids(device_id.value());
   }
+  if (compile_options_overrides != nullptr) {
+    for (const auto& [id, compile_options] : *compile_options_overrides) {
+      if (!llvm::isa<XlaCompileOptions>(compile_options)) {
+        return absl::InvalidArgumentError(
+            "compile_options must be XlaCompileOptions");
+      }
 
-  for (const auto& [id, compile_options] : *compile_options_overrides) {
-    if (!llvm::isa<XlaCompileOptions>(compile_options)) {
-      return absl::InvalidArgumentError(
-          "compile_options must be XlaCompileOptions");
+      TF_ASSIGN_OR_RETURN(
+          CompileOptionsProto compile_options_proto,
+          static_cast<xla::ifrt::XlaCompileOptions*>(compile_options.get())
+              ->compile_options.ToProto());
+      proto.mutable_compile_option_overrides()->insert(
+          {id, compile_options_proto});
     }
-
-    TF_ASSIGN_OR_RETURN(
-        CompileOptionsProto compile_options_proto,
-        static_cast<xla::ifrt::XlaCompileOptions*>(compile_options.get())
-            ->compile_options.ToProto());
-    proto.mutable_compile_option_overrides()->insert(
-        {id, compile_options_proto});
   }
-
   proto.set_propagate_shardings(propagate_shardings);
   return proto;
 }

@@ -66,9 +66,8 @@ namespace m = match;
 // Traverses the graph upward starting at instr and returns the
 // first instruction that is not a convert, bitcast or reshape.
 const HloInstruction* SkipUnaryOps(const HloInstruction* instr) {
-  while (instr->opcode() == HloOpcode::kConvert ||
-         instr->opcode() == HloOpcode::kBitcast ||
-         instr->opcode() == HloOpcode::kReshape) {
+  while (HloPredicateIsOp<HloOpcode::kConvert, HloOpcode::kBitcast,
+                          HloOpcode::kReshape>(instr)) {
     instr = instr->operand(0);
   }
   return instr;
@@ -78,14 +77,13 @@ const HloInstruction* SkipUnaryOps(const HloInstruction* instr) {
 // instrs the users that are not a convert, bitcast or reshape.
 void SkipUnaryOpsTopDownRecursive(HloInstruction* instr,
                                   std::vector<HloInstruction*>& instrs) {
-  if (instr->opcode() == HloOpcode::kConvert ||
-      instr->opcode() == HloOpcode::kBitcast ||
-      instr->opcode() == HloOpcode::kReshape) {
+  if (HloPredicateIsOp<HloOpcode::kConvert, HloOpcode::kBitcast,
+                       HloOpcode::kReshape>(instr)) {
     for (HloInstruction* user : instr->users()) {
       SkipUnaryOpsTopDownRecursive(user, instrs);
     }
   } else {
-    instrs.emplace_back(instr);
+    instrs.push_back(instr);
   }
 }
 
@@ -161,10 +159,10 @@ class UniqueHloInstruction {
 // bound for the size of the scratch space for layer norm kernels.
 absl::StatusOr<int64_t> CConstant(
     se::CudaComputeCapability cuda_compute_capability) {
-  if (cuda_compute_capability.major == se::CudaComputeCapability::AMPERE) {
+  if (cuda_compute_capability.major == se::CudaComputeCapability::kAmpere) {
     return 32 * 128;
   } else if (cuda_compute_capability.major ==
-             se::CudaComputeCapability::HOPPER) {
+             se::CudaComputeCapability::kHopper) {
     return 32 * 144;
   }
   return xla::Internal("Norm kernels require Ampere or Hopper architecture.");
@@ -185,8 +183,8 @@ bool CompatibleElementType(const HloInstruction* instr) {
 std::vector<int64_t> AdjustedDimensions(const Shape& shape,
                                         absl::Span<const int64_t> dimensions) {
   absl::flat_hash_map<int64_t, int64_t> dimension_map;
-  for (int64_t dimension = 0, non_degen_dimension = 0; dimension < shape.rank();
-       ++dimension) {
+  for (int64_t dimension = 0, non_degen_dimension = 0;
+       dimension < shape.dimensions_size(); ++dimension) {
     if (shape.dimensions(dimension) > 1) {
       dimension_map.insert({dimension, non_degen_dimension});
       non_degen_dimension++;
@@ -206,9 +204,9 @@ std::vector<int64_t> AdjustedDimensions(const Shape& shape,
 // the removal of any degenerate dimensions in the output or input.
 std::vector<int64_t> AdjustedDimensions(const HloInstruction* instr) {
   Shape shape;
-  if (instr->opcode() == HloOpcode::kBroadcast) {
+  if (HloPredicateIsOp<HloOpcode::kBroadcast>(instr)) {
     shape = instr->shape();
-  } else if (instr->opcode() == HloOpcode::kReduce) {
+  } else if (HloPredicateIsOp<HloOpcode::kReduce>(instr)) {
     shape = instr->operand(0)->shape();
   } else {
     return {};
@@ -221,7 +219,7 @@ std::vector<int64_t> AdjustedDimensions(const HloInstruction* instr) {
 // reduction.
 bool AppliesAddReduce(const HloInstruction* instr,
                       absl::Span<const int64_t> reduce_dims = {}) {
-  if (instr->opcode() != HloOpcode::kReduce) {
+  if (HloPredicateIsNotOp<HloOpcode::kReduce>(instr)) {
     return false;
   }
 
@@ -236,7 +234,7 @@ bool AppliesAddReduce(const HloInstruction* instr,
          instr->operand(1)->opcode() == HloOpcode::kConstant &&
          ShapeUtil::IsScalar(instr->operand(1)->shape()) &&
          instr->operand(1)->literal().GetAsDouble({}) == 0. &&
-         reduce_comp_root->opcode() == HloOpcode::kAdd &&
+         HloPredicateIsOp<HloOpcode::kAdd>(reduce_comp_root) &&
          reduce_comp_root->operand(0)->opcode() == HloOpcode::kParameter &&
          reduce_comp_root->operand(1)->opcode() == HloOpcode::kParameter;
 }
@@ -245,14 +243,14 @@ bool AppliesAddReduce(const HloInstruction* instr,
 // number of reduced elements.
 bool CalculatesExpectation(const HloInstruction* instr) {
   instr = SkipUnaryOps(instr);
-  if (instr->opcode() != HloOpcode::kMultiply) {
+  if (HloPredicateIsNotOp<HloOpcode::kMultiply>(instr)) {
     return false;
   }
   bool bcast_operand = instr->operand(0)->opcode() != HloOpcode::kBroadcast;
   const HloInstruction *broadcast = instr->operand(bcast_operand),
                        *reduce = SkipUnaryOps(instr->operand(!bcast_operand));
-  if (reduce->opcode() != HloOpcode::kReduce ||
-      broadcast->opcode() != HloOpcode::kBroadcast ||
+  if (HloPredicateIsNotOp<HloOpcode::kReduce>(reduce) ||
+      HloPredicateIsNotOp<HloOpcode::kBroadcast>(broadcast) ||
       broadcast->operand(0)->opcode() != HloOpcode::kConstant) {
     return false;
   }
@@ -330,12 +328,13 @@ std::vector<int64_t> MapDimensions(const Shape& original_shape,
   absl::flat_hash_map<int64_t, std::vector<int64_t>> dimensions_map;
   std::vector<int64_t> original_dimensions, reshaped_dimensions;
   for (int64_t original_dimension = 0, reshaped_dimension = 0;
-       original_dimension < original_shape.rank(); ++original_dimension) {
-    original_dimensions.emplace_back(original_dimension);
+       original_dimension < original_shape.dimensions_size();
+       ++original_dimension) {
+    original_dimensions.push_back(original_dimension);
     while ((reshaped_dimensions.empty() ||
             dimension_product(reshaped_shape, reshaped_dimensions) <
                 dimension_product(original_shape, original_dimensions)) &&
-           reshaped_dimension < reshaped_shape.rank()) {
+           reshaped_dimension < reshaped_shape.dimensions_size()) {
       reshaped_dimensions.emplace_back(reshaped_dimension++);
     }
 
@@ -397,7 +396,7 @@ HloInstruction* FindAddReduceRecursive(
       HloOpcode::kConvert, HloOpcode::kBitcast, HloOpcode::kReshape};
   // Look for a reduction among the users of instr.
   for (HloInstruction* user : instr->users()) {
-    if (user->opcode() == HloOpcode::kReduce) {
+    if (HloPredicateIsOp<HloOpcode::kReduce>(user)) {
       std::vector<int64_t> mapped_reduce_dims =
           MapDimensions(orig_instr_shape, instr->shape(), reduce_dims);
       if (!mapped_reduce_dims.empty() &&
@@ -921,8 +920,10 @@ class CudnnNormRewriterVisitor : public DfsHloRewriteVisitor {
       }
 
       // Layer norm kernels require Ampere or Hopper architectures.
-      if (cuda_compute_capability_.major != se::CudaComputeCapability::AMPERE &&
-          cuda_compute_capability_.major != se::CudaComputeCapability::HOPPER) {
+      if (cuda_compute_capability_.major !=
+              se::CudaComputeCapability::kAmpere &&
+          cuda_compute_capability_.major !=
+              se::CudaComputeCapability::kHopper) {
         VLOG(1) << "Layer norm Custom Calls require Ampere or Hopper "
                    "architectures.";
         return absl::OkStatus();
@@ -959,18 +960,18 @@ class CudnnNormRewriterVisitor : public DfsHloRewriteVisitor {
                                      x.Instr()->shape())) {
         instr = instr->users()[0];
       }
-      if (scale->opcode() == HloOpcode::kConvert &&
+      if (HloPredicateIsOp<HloOpcode::kConvert>(scale) &&
           ShapeUtil::SameElementType(scale->operand(0)->shape(),
                                      bias->shape())) {
         scale = scale->mutable_operand(0);
       }
-      if (bias->opcode() == HloOpcode::kConvert &&
+      if (HloPredicateIsOp<HloOpcode::kConvert>(bias) &&
           ShapeUtil::SameElementType(bias->operand(0)->shape(),
                                      scale->shape())) {
         bias = bias->mutable_operand(0);
       }
-      if (scale->opcode() == HloOpcode::kConvert &&
-          bias->opcode() == HloOpcode::kConvert &&
+      if (HloPredicateIsOp<HloOpcode::kConvert>(scale) &&
+          HloPredicateIsOp<HloOpcode::kConvert>(bias) &&
           ShapeUtil::SameElementType(scale->operand(0)->shape(),
                                      bias->operand(0)->shape())) {
         scale = scale->mutable_operand(0);
@@ -1014,10 +1015,11 @@ class CudnnNormRewriterVisitor : public DfsHloRewriteVisitor {
       // If necessary, transpose the input so that the dimensions not being
       // normalized are the leading dimensions.
       std::vector<int64_t> non_norm_dims;
-      for (int64_t x_dim = 0; x_dim < x.Instr()->shape().rank(); ++x_dim) {
+      for (int64_t x_dim = 0; x_dim < x.Instr()->shape().dimensions_size();
+           ++x_dim) {
         if (std::find(norm_dims.begin(), norm_dims.end(), x_dim) ==
             norm_dims.end()) {
-          non_norm_dims.emplace_back(x_dim);
+          non_norm_dims.push_back(x_dim);
         }
       }
       std::vector<int64_t> non_norm_dims_adjusted =
@@ -1058,7 +1060,7 @@ class CudnnNormRewriterVisitor : public DfsHloRewriteVisitor {
       }
       // cuDNN requires tensors to have at least four dimensions.
       while (reshaped_dims.size() < 4) {
-        reshaped_dims.emplace_back(1);
+        reshaped_dims.push_back(1);
       }
 
       Shape reshaped_shape = ShapeUtil::MakeShape(
@@ -1134,7 +1136,7 @@ class CudnnNormRewriterVisitor : public DfsHloRewriteVisitor {
       // The layer norm training graph separately contains the norm factor
       // divided by the sum of variance and epsilon.
       for (HloInstruction* user : norm_factor->users()) {
-        if (user->opcode() == HloOpcode::kDivide &&
+        if (HloPredicateIsOp<HloOpcode::kDivide>(user) &&
             user->operand_index(norm_factor) == 0) {
           TF_ASSIGN_OR_RETURN(bool changed,
                               MatchNormFactor(user, custom_call, variance,
@@ -1235,7 +1237,7 @@ class CudnnNormRewriterVisitor : public DfsHloRewriteVisitor {
           TF_ASSIGN_OR_RETURN(new_instr,
                               MakeReshapeHlo(old_instr->shape(), new_gte));
         }
-        if (old_instr->opcode() != HloOpcode::kDivide) {
+        if (HloPredicateIsNotOp<HloOpcode::kDivide>(old_instr)) {
           // Replace the result of the layer norm or the expectation.
           TF_RETURN_IF_ERROR(ReplaceInstruction(old_instr, new_instr));
         } else {

@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -28,7 +29,6 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/types/optional.h"
 #include "absl/types/span.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -44,16 +44,19 @@ limitations under the License.
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/Region.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LLVM.h"
+#include "stablehlo/dialect/Base.h"
 #include "xla/comparison_util.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -71,14 +74,15 @@ limitations under the License.
 #include "xla/layout.h"
 #include "xla/literal.h"
 #include "xla/mlir_hlo/mhlo/IR/hlo_ops.h"
+#include "xla/primitive_util.h"
 #include "xla/protobuf_util.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
 
 using llvm::APInt;
 using llvm::ArrayRef;
@@ -117,7 +121,8 @@ std::string SanitizeFunctionName(llvm::StringRef name) {
 bool DotIsDefault(const HloInstruction* instruction) {
   // If LHS/RHS has rank greater than 2, not default dot
   const auto& operands = instruction->operands();
-  if (operands[0]->shape().rank() > 2 || operands[1]->shape().rank() > 2) {
+  if (operands[0]->shape().dimensions_size() > 2 ||
+      operands[1]->shape().dimensions_size() > 2) {
     return false;
   }
 
@@ -126,7 +131,7 @@ bool DotIsDefault(const HloInstruction* instruction) {
   default_dimension_numbers.add_lhs_contracting_dimensions(
       instruction->operand(0)->shape().dimensions_size() == 1 ? 0 : 1);
   default_dimension_numbers.add_rhs_contracting_dimensions(0);
-  return protobuf_util::ProtobufEquals(dnums, default_dimension_numbers);
+  return protobuf_util::HaveSameSerialization(dnums, default_dimension_numbers);
 }
 
 ArrayRef<HloSharding> FlattenTupleSharding(const HloSharding& sharding) {
@@ -168,6 +173,59 @@ Operation* createReturnOp(mlir::OpBuilder& builder, mlir::Location loc,
     return builder.create<mlir::func::ReturnOp>(loc, operands);
   }
   return builder.create<mlir::mhlo::ReturnOp>(loc, operands);
+}
+
+// Creates an array of zeros like the given MLIR type, if type has bounded
+// dynamism, the constant is padded and set to the dimenison size of the
+// operand.
+//
+// Example ZeroLike([<=5] operand):
+// %c = constant dense<0> : tensor<5xf32>
+// %0 = get_dimension_size %operand
+// %1 = set_dimension_size %c, %0, bounded_dim={0}
+//
+// Note: Currently this only supports a single bounded dimension.
+absl::StatusOr<mlir::Value> createConstantZeroLike(mlir::Value operand,
+                                                   Shape input_shape,
+                                                   mlir::OpBuilder* builder,
+                                                   mlir::Location loc) {
+  TF_ASSIGN_OR_RETURN(
+      mlir::RankedTensorType type,
+      ConvertTensorShapeToType<mlir::RankedTensorType>(input_shape, *builder));
+
+  LLVM_DEBUG(llvm::dbgs() << "CreateConstantZeroLike: " << operand << ", "
+                          << type << '\n');
+  if (type.hasStaticShape())
+    return builder
+        ->create<mlir::mhlo::ConstantOp>(loc, builder->getZeroAttr(type))
+        ->getResult(0);
+
+  // Note: Currently this only supports a single bounded dimension.
+  if (!mlir::hlo::hasSingleBoundedDimension(type))
+    return Internal(
+        "Currently HLO to MHLO only supports a single bounded dimension.");
+
+  auto bounded_dim = std::distance(type.getShape().begin(),
+                                   llvm::find_if(type.getShape(), [](auto dim) {
+                                     return mlir::ShapedType::isDynamic(dim);
+                                   }));
+
+  // Create a constant with no bounded dynamism, drop tensor encoding.
+  ArrayRef<int64_t> padded_dims(input_shape.dimensions().begin(),
+                                input_shape.dimensions().end());
+  auto padded_type =
+      mlir::RankedTensorType::get(padded_dims, type.getElementType());
+  auto padded_constant = builder->create<mlir::mhlo::ConstantOp>(
+      loc, builder->getZeroAttr(padded_type));
+
+  // Get or Set the dimensions size based on the operand type.
+  auto dim_size = builder->create<mlir::mhlo::GetDimensionSizeOp>(
+      loc, operand, builder->getI64IntegerAttr(bounded_dim));
+  std::vector<mlir::Value> operands = {padded_constant->getResult(0), dim_size};
+  std::vector<mlir::NamedAttribute> attributes{builder->getNamedAttr(
+      "dimension", builder->getI64IntegerAttr(bounded_dim))};
+  return builder->create<mlir::mhlo::SetDimensionSizeOp>(loc, type, operands,
+                                                         attributes);
 }
 
 }  // namespace
@@ -282,7 +340,7 @@ absl::Status HloFunctionImporter::ImportAsRegion(
 absl::StatusOr<FuncOp> HloFunctionImporter::ImportAsFunc(
     const HloComputation& computation, bool is_main) {
   std::string computation_name =
-      is_main ? "main" : SanitizeFunctionName(computation.name());
+      is_main ? "main" : SanitizeFunctionName(ToStringRef(computation.name()));
 
   FuncOp* imported(nullptr);
   if (function_map_) {
@@ -365,7 +423,7 @@ absl::StatusOr<FuncOp> HloFunctionImporter::ImportAsFunc(
         }
         // NOTE: since we are flattening args, all arguments will share the same
         // location as the tuple parameter instruction.
-        function.getArgument(i).setLoc(
+        function.getArgument(arg_index).setLoc(
             mlir::mhlo::GenerateInstructionLocation(instruction, context_));
         ++arg_index;
       }
@@ -398,7 +456,15 @@ absl::StatusOr<FuncOp> HloFunctionImporter::ImportAsFunc(
       ++arg_index;
     }
   }
-  if (computation.root_instruction()->has_sharding()) {
+  // TODO(b/260756663): Token sharding is unverified, legacy users provide
+  // multiple sharding values for a single token output.
+  bool is_token = computation.root_instruction()->shape().IsToken();
+  if (is_token && computation.root_instruction()->has_sharding()) {
+    function.setResultAttr(
+        0, kShardingAttr,
+        ConvertSharding(computation.root_instruction()->sharding(), builder_));
+  }
+  if (!is_token && computation.root_instruction()->has_sharding()) {
     ArrayRef<HloSharding> ret_shardings =
         computation.root_instruction()->sharding();
     if (flatten_computation_args_result_) {
@@ -415,8 +481,9 @@ absl::StatusOr<FuncOp> HloFunctionImporter::ImportAsFunc(
     }
   }
   if (computation.execution_thread() != "main") {
-    function->setAttr("execution_thread",
-                      builder_->getStringAttr(computation.execution_thread()));
+    function->setAttr(
+        "execution_thread",
+        builder_->getStringAttr(ToStringRef(computation.execution_thread())));
   }
 
   symbol_table_.insert(function);
@@ -434,7 +501,6 @@ absl::StatusOr<FuncOp> HloFunctionImporter::ImportAsFunc(
 absl::Status HloFunctionImporter::ImportAsRegion(
     const HloComputation& computation, mlir::Region* region) {
   auto loc = region->getLoc();
-  // TODO(hinsu): Store computation name as an attribute for round-trip.
   auto* block = new mlir::Block;
   region->push_back(block);
 
@@ -494,7 +560,6 @@ absl::Status HloFunctionImporter::ImportInstructions(
   llvm::SmallVector<Value, 4> arguments(block->args_begin(), block->args_end());
   mlir::OpBuilder builder = mlir::OpBuilder::atBlockEnd(block);
 
-  // TODO(suderman): Add location tracking details.
   mlir::Location loc = builder.getUnknownLoc();
 
   bool is_func = llvm::isa<FuncOp>(block->getParentOp());
@@ -667,7 +732,7 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
           "called_computation",
           mlir::FlatSymbolRefAttr::get(builder_->getContext(),
                                        function.getName())));
-      auto execution_thread = async_op->async_execution_thread();
+      auto execution_thread = ToStringRef(async_op->async_execution_thread());
       attributes.push_back(builder_->getNamedAttr(
           "execution_thread", builder_->getStringAttr(execution_thread)));
       function->setAttr("execution_thread",
@@ -788,6 +853,43 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
                                             attributes)
           .getOperation();
     }
+    case HloOpcode::kRaggedAllToAll: {
+      llvm::SmallVector<NamedAttribute> backendConfigAttributes;
+      backendConfigAttributes.push_back(
+          ConvertReplicaGroups(instruction->replica_groups(), builder_));
+      if (instruction->channel_id().has_value()) {
+        backendConfigAttributes.push_back(builder_->getNamedAttr(
+            "channel_id",
+            builder_->getI64IntegerAttr(instruction->channel_id().value())));
+      }
+      attributes.push_back(builder_->getNamedAttr(
+          "backend_config",
+          builder_->getDictionaryAttr(backendConfigAttributes)));
+      attributes.push_back(builder_->getNamedAttr(
+          "call_target_name", builder_->getStringAttr("ragged_all_to_all")));
+      attributes.push_back(builder_->getNamedAttr(
+          "api_version",
+          mlir::mhlo::CustomCallApiVersionAttr::get(
+              builder_->getContext(),
+              mlir::mhlo::CustomCallApiVersion::API_VERSION_TYPED_FFI)));
+      return func_builder
+          ->create<mlir::mhlo::CustomCallOp>(loc, result_type, operands,
+                                             attributes)
+          .getOperation();
+    }
+    case HloOpcode::kRaggedDot: {
+      attributes.push_back(builder_->getNamedAttr(
+          "precision_config",
+          ConvertPrecisionConfig(&instruction->precision_config(), builder_)));
+      attributes.push_back(builder_->getNamedAttr(
+          "ragged_dot_dimension_numbers",
+          ConvertRaggedDotDimensionNumbers(
+              instruction->ragged_dot_dimension_numbers(), builder_)));
+      return func_builder
+          ->create<mlir::mhlo::RaggedDotOp>(loc, result_type, operands,
+                                            attributes)
+          .getOperation();
+    }
     case HloOpcode::kCall: {
       TF_ASSIGN_OR_RETURN(
           FuncOp function,
@@ -837,7 +939,8 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
             frontend_attributes_map.find("composite.attributes")->second,
             builder_->getContext());
         mlir::FlatSymbolRefAttr decomposition = mlir::SymbolRefAttr::get(
-            builder_->getContext(), instruction->to_apply()->name());
+            builder_->getContext(),
+            ToStringRef(instruction->to_apply()->name()));
         mlir::IntegerAttr version = builder_->getIntegerAttr(
             builder_->getI32Type(),
             std::stoi(
@@ -855,45 +958,45 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
         return new_operation;
       }
 
-      if (flatten_computation_args_result_) {
-        // Flatten the tuple-typed operands.
-        llvm::SmallVector<Value> flattened_operands = FlattenTupleValues(
-            func_builder, loc, operands, function.getNumArguments());
-        new_operation = func_builder->create<mlir::func::CallOp>(
-            loc, function, flattened_operands);
-        for (auto attr : attributes) {
-          new_operation->setAttr(attr.getName(), attr.getValue());
-        }
-        // Flatten the tuple-typed results.
-        mlir::ValueRange flattened_results_ref(new_operation->getResults());
-        TF_ASSIGN_OR_RETURN(auto result_type,
-                            ConvertShapeToType<RankedTensorType>(
-                                instruction->shape(), *builder_));
-        new_operation = CreateTupleValue(func_builder, loc,
-                                         flattened_results_ref, result_type)
-                            .getDefiningOp();
-      } else {
-        new_operation =
-            func_builder->create<mlir::func::CallOp>(loc, function, operands);
-        for (const auto& attr : attributes) {
-          new_operation->setAttr(attr.getName(), attr.getValue());
-        }
-      }
       // Shardy currently requires roundtripping passes after HW specific passes
       // which introduce kCall with backend_config for host communication. If
       // we get to a point where compiler flow for sharding propagation doesn't
       // require roundtrip this can likely be removed.
-      const std::string& raw_backend_config =
-          instruction->raw_backend_config_string();
-      if (!raw_backend_config.empty()) {
-        llvm::SmallVector<NamedAttribute, 1> frontend_attributes;
-        frontend_attributes.push_back(builder_->getNamedAttr(
-            "backend_config", builder_->getStringAttr(raw_backend_config)));
-        new_operation->setAttr(
-            kFrontendAttributesAttr,
-            builder_->getDictionaryAttr(frontend_attributes));
+      auto annotateCallOp = [&](Operation* call) {
+        const std::string& raw_backend_config =
+            instruction->raw_backend_config_string();
+        if (!raw_backend_config.empty()) {
+          llvm::SmallVector<NamedAttribute, 1> frontend_attributes;
+          frontend_attributes.push_back(builder_->getNamedAttr(
+              "backend_config", builder_->getStringAttr(raw_backend_config)));
+          call->setAttr(kFrontendAttributesAttr,
+                        builder_->getDictionaryAttr(frontend_attributes));
+        }
+        for (auto attr : attributes) {
+          call->setAttr(attr.getName(), attr.getValue());
+        }
+      };
+
+      if (!flatten_computation_args_result_) {
+        auto call =
+            func_builder->create<mlir::func::CallOp>(loc, function, operands);
+        annotateCallOp(call);
+        return call;
       }
-      return new_operation;
+      // Flatten the tuple-typed operands.
+      llvm::SmallVector<Value> flattened_operands = FlattenTupleValues(
+          func_builder, loc, operands, function.getNumArguments());
+      auto call = func_builder->create<mlir::func::CallOp>(loc, function,
+                                                           flattened_operands);
+      annotateCallOp(call);
+      // Flatten the tuple-typed results.
+      mlir::ValueRange flattened_results_ref(call->getResults());
+      TF_ASSIGN_OR_RETURN(auto result_type,
+                          ConvertShapeToType<RankedTensorType>(
+                              instruction->shape(), *builder_));
+      return CreateTupleValue(func_builder, loc, flattened_results_ref,
+                              result_type)
+          .getDefiningOp();
     }
     case HloOpcode::kCollectiveBroadcast: {
       auto collective_broadcast = Cast<HloChannelInstruction>(instruction);
@@ -1264,7 +1367,7 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
     }
     case HloOpcode::kSendDone: {
       return ImportAsyncOpDone(instruction, loc, operands, attributes,
-                               result_type, func_builder);
+                               result_type, func_builder, HloOpcode::kSend);
     }
     case HloOpcode::kRecv: {
       return ImportRecv(instruction, loc, operands, attributes, result_type,
@@ -1272,7 +1375,7 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
     }
     case HloOpcode::kRecvDone: {
       return ImportAsyncOpDone(instruction, loc, operands, attributes,
-                               result_type, func_builder);
+                               result_type, func_builder, HloOpcode::kRecv);
     }
     case HloOpcode::kConditional: {
       llvm::SmallVector<Type, 4> rets;
@@ -1344,8 +1447,6 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
                                       rets[0]);
     }
     case HloOpcode::kConcatenate: {
-      // TODO(b/132057942): Support taking an uint64_t instead of an
-      // IntegerAttr for concatenate dimension.
       return func_builder
           ->create<mlir::mhlo::ConcatenateOp>(
               loc, result_type, operands,
@@ -1768,6 +1869,42 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
           "precision_config",
           ConvertPrecisionConfig(&instruction->precision_config(), builder_)));
 
+      // If the element types of the operands for convolution are different,
+      // insert a convert op to convert the operands to the common element type
+      // while preserving the values.
+      auto lhs = operands[0];
+      auto rhs = operands[1];
+      auto lhs_element_type = instruction->operand(0)->shape().element_type();
+      auto rhs_element_type = instruction->operand(1)->shape().element_type();
+      if (lhs_element_type != rhs_element_type) {
+        if (primitive_util::CastPreservesValues(lhs_element_type,
+                                                rhs_element_type)) {
+          auto convert_op_return_type =
+              mlir::cast<mlir::ShapedType>(lhs.getType())
+                  .clone(mlir::getElementTypeOrSelf(rhs));
+          lhs = func_builder->create<mlir::mhlo::ConvertOp>(
+              loc, convert_op_return_type, lhs);
+        } else if (primitive_util::CastPreservesValues(rhs_element_type,
+                                                       lhs_element_type)) {
+          auto convert_op_return_type =
+              mlir::cast<mlir::ShapedType>(rhs.getType())
+                  .clone(mlir::getElementTypeOrSelf(lhs));
+          rhs = func_builder->create<mlir::mhlo::ConvertOp>(
+              loc, convert_op_return_type, rhs);
+        } else {
+          return InvalidArgument(
+              "Unsupported conversion between element types of operands (%s "
+              "and %s) for convolution.",
+              instruction->operand(0)->shape().ToString(),
+              instruction->operand(1)->shape().ToString());
+        }
+        return func_builder
+            ->create<mlir::mhlo::ConvolutionOp>(
+                loc, result_type, std::vector<mlir::Value>{lhs, rhs},
+                attributes)
+            .getOperation();
+      }
+
       return func_builder
           ->create<mlir::mhlo::ConvolutionOp>(loc, result_type, operands,
                                               attributes)
@@ -1838,13 +1975,16 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
 
       // Return type is boolean, let's use `operand != 0` instead of Convert.
       Shape input_shape = instruction->operand(0)->shape();
-      TF_ASSIGN_OR_RETURN(mlir::Type type,
-                          ConvertTensorShapeToType<mlir::RankedTensorType>(
-                              input_shape, *func_builder));
-      auto zero = func_builder->create<mlir::mhlo::ConstantOp>(
-          loc, func_builder->getZeroAttr(type));
+      TF_ASSIGN_OR_RETURN(
+          mlir::Value zero,
+          createConstantZeroLike(operands[0], input_shape, func_builder, loc));
+      std::vector<mlir::Value> compare_operands = {operands[0], zero};
+      std::vector<mlir::NamedAttribute> attributes = {builder_->getNamedAttr(
+          "comparison_direction", mlir::mhlo::ComparisonDirectionAttr::get(
+                                      func_builder->getContext(),
+                                      mlir::mhlo::ComparisonDirection::NE))};
       return {func_builder->create<mlir::mhlo::CompareOp>(
-          loc, operands[0], zero, mlir::mhlo::ComparisonDirection::NE)};
+          loc, result_type, compare_operands, attributes)};
     }
     case HloOpcode::kOptimizationBarrier: {
       llvm::SmallVector<Value> flattened_operands;
@@ -1860,7 +2000,7 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
     }
     case HloOpcode::kDomain: {
       auto domain_kind = mlir::mhlo::symbolizeDomainKind(
-          instruction->user_side_metadata().Kind());
+          ToStringRef(instruction->user_side_metadata().Kind()));
       if (!domain_kind || *domain_kind != mlir::mhlo::DomainKind::sharding) {
         return InvalidArgument(
             "Invalid domain kind in hlo -> mhlo import. Only 'sharding' is "
@@ -1876,8 +2016,6 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
       // never for compiling production models.
       //
       // Since this is hardcoded as such in the proto, we must follow suit.
-      // TODO(b/208783683): The one improvement we can make on this is to move
-      // from the a serialized proto representation to a parsable string
       auto exit_metadata = ShardingMetadata::ToShardingMetadata(
           &instruction->operand_side_metadata());
       auto entry_metadata = ShardingMetadata::ToShardingMetadata(
@@ -1957,10 +2095,6 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
       NO_ATTRIBUTE_CASE(kTanh, TanhOp);
       NO_ATTRIBUTE_CASE(kTuple, TupleOp);
       NO_ATTRIBUTE_CASE(kXor, XorOp);
-      // TODO(b/129422361) Copy needs special handling because it is not
-      // defined in tensorflow/compiler/xla/client/xla_builder.h. See
-      // operation semantics in
-      // g3doc/platforms/xla/g3doc/internal/hlo_semantics#copy
       NO_ATTRIBUTE_CASE(kCopy, CopyOp);
 
 #undef NO_ATTRIBUTE_CASE
@@ -1974,8 +2108,8 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
       llvm::SmallVector<Type> flattened_ret_types;
       FlattenTupleType(result_type, flattened_ret_types);
 
-      auto fusion_kind =
-          mlir::mhlo::symbolizeFusionKind(ToString(instruction->fusion_kind()));
+      auto fusion_kind = mlir::mhlo::symbolizeFusionKind(
+          ToStringRef(ToString(instruction->fusion_kind())));
       attributes.push_back(builder_->getNamedAttr(
           "fusion_kind", mlir::mhlo::FusionKindAttr::get(
                              func_builder->getContext(), fusion_kind.value())));

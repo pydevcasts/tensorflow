@@ -30,6 +30,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/service/collective_opt_utils.h"
+#include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/shape.h"
 #include "xla/status_macros.h"
@@ -49,7 +50,7 @@ absl::StatusOr<bool> ReduceScatterCreator::Run(
        module->MakeNonfusionComputations(execution_threads)) {
     for (HloInstruction *instruction :
          computation->MakeInstructionPostOrder()) {
-      if (instruction->opcode() != HloOpcode::kAllReduce) {
+      if (HloPredicateIsNotOp<HloOpcode::kAllReduce>(instruction)) {
         continue;
       }
       auto *ar = Cast<HloAllReduceInstruction>(instruction);
@@ -81,9 +82,9 @@ absl::StatusOr<bool> ReduceScatterCreator::Run(
                                      scatter_dim_size * ar_spec->group_size);
         rs_input = computation->AddInstruction(HloInstruction::CreateSlice(
             scatter_shape, rs_input,
-            std::vector<int64_t>(scatter_shape.rank(), 0),
+            std::vector<int64_t>(scatter_shape.dimensions_size(), 0),
             scatter_shape.dimensions(),
-            std::vector<int64_t>(scatter_shape.rank(), 1)));
+            std::vector<int64_t>(scatter_shape.dimensions_size(), 1)));
       }
       scatter_shape.set_dimensions(split_dim, scatter_dim_size);
 
@@ -98,6 +99,7 @@ absl::StatusOr<bool> ReduceScatterCreator::Run(
               scatter_shape, {rs_input}, ar->to_apply(), ar->device_list(),
               ar->constrain_layout(), channel_id, ar->use_global_device_ids(),
               ar_spec->split_dim));
+      ars->CopyBackendConfigFrom(ar);
 
       // If there was an intervening reshape, reshape the non-split dimensions
       // to match that existing reshape. Basically we can just reshape the ars

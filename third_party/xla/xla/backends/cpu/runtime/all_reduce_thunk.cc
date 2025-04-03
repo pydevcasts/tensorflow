@@ -21,25 +21,25 @@ limitations under the License.
 #include <utility>
 
 #include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
-#include "absl/types/span.h"
+#include "xla/backends/cpu/collectives/cpu_collectives.h"
 #include "xla/backends/cpu/runtime/collective_thunk.h"
 #include "xla/backends/cpu/runtime/thunk.h"
+#include "xla/core/collectives/communicator.h"
 #include "xla/primitive_util.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/collective_ops_utils.h"
-#include "xla/service/cpu/collectives_interface.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/logging.h"
-#include "tsl/platform/statusor.h"
-#include "tsl/profiler/lib/traceme.h"
 
 namespace xla::cpu {
 
@@ -60,14 +60,14 @@ absl::StatusOr<std::unique_ptr<AllReduceThunk>> AllReduceThunk::Create(
 AllReduceThunk::AllReduceThunk(Info info, ReductionKind reduction_kind,
                                OpParams op_params, OpBuffers op_buffers,
                                OpResources op_resources, bool single_replica)
-    : CollectiveThunk(Kind::kAllReduce, std::move(info), std::move(op_params),
-                      std::move(op_buffers), std::move(op_resources)),
+    : CollectiveThunk(CollectiveKind::kAllReduce, std::move(info),
+                      std::move(op_params), std::move(op_buffers),
+                      std::move(op_resources)),
       reduction_kind_(reduction_kind),
       single_replica_(single_replica) {}
 
 tsl::AsyncValueRef<AllReduceThunk::ExecuteEvent> AllReduceThunk::Execute(
     const ExecuteParams& params) {
-  tsl::profiler::TraceMe trace([&] { return TraceMeEncode(); });
 
   TF_ASSIGN_OR_RETURN(OpDeviceMemory data, GetOpDeviceMemory(params));
 
@@ -101,13 +101,13 @@ tsl::AsyncValueRef<AllReduceThunk::ExecuteEvent> AllReduceThunk::Execute(
 
   return ExecuteWithCommunicator(
       params.collective_params,
-      [&](const RendezvousKey& key, CollectivesCommunicator& comm) {
+      [&](const RendezvousKey& key, Communicator& comm) {
+        CpuCollectives::Executor executor(key, DefaultCollectiveTimeout());
         for (int32_t i = 0; i < data.source.size(); ++i) {
           const Shape& shape = destination_shape(i);
           TF_RETURN_IF_ERROR(comm.AllReduce(
-              key, reduction_kind_, shape.element_type(),
-              ShapeUtil::ElementsIn(shape), data.source[i].opaque(),
-              data.destination[i].opaque(), DefaultCollectiveTimeout()));
+              data.source[i], data.destination[i], shape.element_type(),
+              ShapeUtil::ElementsIn(shape), reduction_kind_, executor));
         }
         return absl::OkStatus();
       });

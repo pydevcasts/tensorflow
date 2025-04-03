@@ -16,14 +16,20 @@ limitations under the License.
 #include "xla/hlo/transforms/expanders/eigh_expander.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
-#include <memory>
 #include <numeric>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "absl/algorithm/container.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
+#include "absl/types/span.h"
 #include "xla/hlo/builder/lib/arithmetic.h"
 #include "xla/hlo/builder/lib/comparators.h"
 #include "xla/hlo/builder/lib/constants.h"
@@ -38,6 +44,7 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
 #include "xla/util.h"
+#include "xla/xla_data.pb.h"
 #include "tsl/platform/errors.h"
 
 // Parallel two-sided Jacobi symmetric eigendecomposition.
@@ -273,7 +280,7 @@ absl::StatusOr<FrobeniusNorms> ComputeFrobeniusNorms(XlaOp w_tl, XlaOp w_tr,
                                                      XlaOp w_bl, XlaOp w_br) {
   XlaBuilder* builder = w_tl.builder();
   TF_ASSIGN_OR_RETURN(Shape shape, builder->GetShape(w_tl));
-  const int64_t num_dims = shape.rank();
+  const int64_t num_dims = shape.dimensions_size();
   auto square_norm = [](XlaOp x) -> XlaOp {
     return Real(x * MaybeConjugate(x, true));
   };
@@ -356,7 +363,7 @@ absl::Status EighExpander::SortByEigenvalues(XlaOp& v, XlaOp& w) {
   XlaBuilder* builder = v.builder();
   TF_ASSIGN_OR_RETURN(Shape v_shape, builder->GetShape(v));
   TF_ASSIGN_OR_RETURN(Shape w_shape, builder->GetShape(w));
-  const int64_t num_dims = v_shape.rank();
+  const int64_t num_dims = v_shape.dimensions_size();
   auto dimensions = v_shape.dimensions();
 
   std::vector<int64_t> broadcast_dims(num_dims - 1);
@@ -432,7 +439,7 @@ XlaOp EighExpander::BuildEigh(XlaOp a, bool lower, int64_t max_iter, float tol,
   XlaBuilder* builder = a.builder();
   return builder->ReportErrorOrReturn([&]() -> absl::StatusOr<XlaOp> {
     TF_ASSIGN_OR_RETURN(Shape a_shape, builder->GetShape(a));
-    const int64_t num_dims = a_shape.rank();
+    const int64_t num_dims = a_shape.dimensions_size();
     if (num_dims < 2) {
       return InvalidArgument(
           "Arguments to Eigen decomposition must have rank >= 2: got shape %s.",

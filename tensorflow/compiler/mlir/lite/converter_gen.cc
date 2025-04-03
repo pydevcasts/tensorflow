@@ -15,7 +15,6 @@ limitations under the License.
 
 #include <assert.h>
 
-#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -569,7 +568,7 @@ static bool RuntimeVerifierWriterMain(raw_ostream &os,
        << "::VerifyTflRuntimeConstraints(::mlir::Operation *op, bool "
           "emit_error_on_verify_fail) {\n";
     os << "  auto top = cast<" << op.getCppClassName() << ">(op); (void)top;\n";
-    verify_ctx.addSubst("_op", "top");
+    verify_ctx.addSubst("_op", "(*op)");
 
     for (int i = 0, e = op.getNumOperands(); i < e; ++i) {
       auto &value = op.getOperand(i);

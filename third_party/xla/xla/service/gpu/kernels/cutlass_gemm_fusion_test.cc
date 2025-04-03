@@ -34,11 +34,13 @@ limitations under the License.
 #include "xla/service/gpu/kernels/custom_kernel_fusion_pattern.h"
 #include "xla/service/gpu/kernels/cutlass_gemm_custom_kernel.h"
 #include "xla/service/gpu/transforms/custom_kernel_fusion_rewriter.h"
+#include "xla/stream_executor/device_description.h"
 #include "xla/tests/hlo_test_base.h"
-#include "xla/tests/verified_hlo_module.h"
+#include "xla/tsl/platform/test.h"
 #include "xla/types.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/test.h"
+
+using stream_executor::CudaComputeCapability;
 
 namespace xla::gpu {
 
@@ -264,6 +266,38 @@ TEST_F(CutlassFusionTest, RowMajorGemmWithDynamicUpdateSlice) {
   RunAndFilecheckHloRewrite(hlo, std::move(pass), expected);
 }
 
+// Test that the DUS pattern is not applied for V100, because it causes
+// `CUDA_ERROR_ILLEGAL_ADDRESS` : an illegal memory access was encountered.
+TEST_F(CutlassFusionTest, DoNotRewriteOnV100) {
+  const char* hlo = R"(
+    HloModule test
+
+    ENTRY %main (p0: f32[2,2,2], p1: f32[2,2], i: s32[]) -> f32[2,2,2] {
+      %p0 = f32[2,2,2]{2,1,0} parameter(0)
+      %p1 = f32[2,2]{1,0} parameter(1)
+      %i = s32[] parameter(2)
+
+      %dot = f32[2,2]{1,0} dot(%p1, %p1),
+               lhs_contracting_dims={1},
+               rhs_contracting_dims={0}
+      %bc = f32[1,2,2]{2,1,0} bitcast(%dot)
+
+      ROOT %r = f32[2,2,2]{2,1,0} dynamic-update-slice(%p0, %bc, %i, %i, %i)
+    }
+  )";
+
+  CustomKernelFusionPatternRegistry patterns;
+  patterns.Emplace<CutlassGemmWithDynamicUpdateSlicePattern>();
+
+  auto device = TestGpuDeviceInfo::RTXA6000DeviceInfo(CudaComputeCapability{
+      CudaComputeCapability::CudaComputeCapabilities::kVolta, 0});
+  CustomKernelFusionRewriter pass(&device, /*kernel_index=*/0, &patterns);
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo));
+  TF_ASSERT_OK_AND_ASSIGN(bool changed,
+                          RunHloPass(std::move(pass), module.get()));
+  EXPECT_FALSE(changed);
+}
+
 TEST_F(CutlassFusionTest, RowMajorGemmWithDynamicUpdateSliceMultipleUses) {
   const char* hlo = R"(
     HloModule test
@@ -409,8 +443,6 @@ TEST_F(CutlassFusionTest, RowMajorGemmKernel) {
                                       error_spec, /*run_hlo_passes=*/false));
 }
 
-// TODO(b/362698643): Add a test for a kernel with a left-hand side upcast once
-// we add a kernel for it.
 TEST_F(CutlassFusionTest, GemmWithRightHandSideUpcastKernel) {
   ErrorSpec error_spec{/*aabs=*/1e-3, /*arel=*/1e-3};
 
@@ -452,6 +484,49 @@ TEST_F(CutlassFusionTest, GemmWithRightHandSideUpcastKernel) {
                                       error_spec, /*run_hlo_passes=*/false));
 }
 
+TEST_F(CutlassFusionTest, GemmWithRightHandSideUpcastKernelSplitK) {
+  // kernel_index = 1 is the SplitK kernel. It only works for contracting
+  // dimension size 32 and 64.
+  ErrorSpec error_spec{/*aabs=*/1e-3, /*arel=*/1e-3};
+
+  const char* hlo_text_cublas = R"(
+  HloModule cublas
+
+  ENTRY e {
+    p0 = f32[16,32]{1,0} parameter(0)
+    p1 = bf16[32,8]{1,0} parameter(1)
+    c1 = f32[32,8]{1,0} convert(p1)
+    gemm = (f32[16,8]{1,0}, s8[0]{0}) custom-call(p0, c1),
+      custom_call_target="__cublas$gemm",
+      backend_config={"gemm_backend_config":{"alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":[1],"rhs_contracting_dimensions":[0],"lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},"alpha_imag":0,"precision_config":{"operand_precision":["DEFAULT","DEFAULT"]},"epilogue":"DEFAULT"}}
+    ROOT get-tuple-element = f32[16,8]{1,0} get-tuple-element(gemm), index=0
+  })";
+
+  const char* hlo_text_custom_fusion = R"(
+  HloModule cutlass
+
+  cutlass_gemm_with_upcast {
+    p0 = f32[16,32]{1,0} parameter(0)
+    p1 = bf16[32,8]{1,0} parameter(1)
+    c1 = f32[32,8]{1,0} convert(p1)
+    ROOT dot = f32[16,8]{1,0} dot(p0, c1),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  }
+
+  ENTRY e {
+    p0 = f32[16,32]{1,0} parameter(0)
+    p1 = bf16[32,8]{1,0} parameter(1)
+    ROOT _ = f32[16,8]{1,0} fusion(p0, p1), kind=kCustom,
+    calls=cutlass_gemm_with_upcast,
+      backend_config={"fusion_backend_config":{kind: "__custom_fusion",
+      custom_fusion_config: {"name":"cutlass_gemm_with_upcast",
+      "kernel_index":1}}}
+  })";
+
+  EXPECT_TRUE(RunAndCompareTwoModules(hlo_text_cublas, hlo_text_custom_fusion,
+                                      error_spec, /*run_hlo_passes=*/false));
+}
+
 TEST_F(CutlassFusionTest, GemmWithLeftHandAndRightHandSideUpcastKernel) {
   ErrorSpec error_spec{/*aabs=*/1e-3, /*arel=*/1e-3};
 
@@ -486,6 +561,48 @@ TEST_F(CutlassFusionTest, GemmWithLeftHandAndRightHandSideUpcastKernel) {
     p1 = s8[32,8]{1,0} parameter(1)
     ROOT _ = f32[16,8]{1,0} fusion(p0, p1), kind=kCustom, calls=cutlass_gemm_with_upcast,
       backend_config={"fusion_backend_config":{kind: "__custom_fusion", custom_fusion_config: {"name":"cutlass_gemm_with_upcast", "kernel_index":0}}}
+  })";
+
+  EXPECT_TRUE(RunAndCompareTwoModules(hlo_text_cublas, hlo_text_custom_fusion,
+                                      error_spec, /*run_hlo_passes=*/false));
+}
+
+TEST_F(CutlassFusionTest, GemmWithLeftHandAndRightHandSideUpcastKernelSplitK) {
+  // kernel_index = 1 is the SplitK kernel. It only works for contracting
+  // dimension size 64 and 128.
+  ErrorSpec error_spec{/*aabs=*/1e-3, /*arel=*/1e-3};
+
+  const char* hlo_text_cublas = R"(
+  HloModule cublas
+
+  ENTRY e {
+    p0 = bf16[16,128]{1,0} parameter(0)
+    c0 = f32[16,128]{1,0} convert(p0)
+    p1 = s8[128,8]{1,0} parameter(1)
+    c1 = f32[128,8]{1,0} convert(p1)
+    gemm = (f32[16,8]{1,0}, s8[0]{0}) custom-call(c0, c1),
+      custom_call_target="__cublas$gemm",
+      backend_config={"gemm_backend_config":{"alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":[1],"rhs_contracting_dimensions":[0],"lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},"alpha_imag":0,"precision_config":{"operand_precision":["DEFAULT","DEFAULT"]},"epilogue":"DEFAULT"}}
+    ROOT get-tuple-element = f32[16,8]{1,0} get-tuple-element(gemm), index=0
+  })";
+
+  const char* hlo_text_custom_fusion = R"(
+  HloModule cutlass
+
+  cutlass_gemm_with_upcast {
+    p0 = bf16[16,128]{1,0} parameter(0)
+    c0 = f32[16,128]{1,0} convert(p0)
+    p1 = s8[128,8]{1,0} parameter(1)
+    c1 = f32[128,8]{1,0} convert(p1)
+    ROOT dot = f32[16,8]{1,0} dot(c0, c1),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  }
+
+  ENTRY e {
+    p0 = bf16[16,128]{1,0} parameter(0)
+    p1 = s8[128,8]{1,0} parameter(1)
+    ROOT _ = f32[16,8]{1,0} fusion(p0, p1), kind=kCustom, calls=cutlass_gemm_with_upcast,
+      backend_config={"fusion_backend_config":{kind: "__custom_fusion", custom_fusion_config: {"name":"cutlass_gemm_with_upcast", "kernel_index":1}}}
   })";
 
   EXPECT_TRUE(RunAndCompareTwoModules(hlo_text_cublas, hlo_text_custom_fusion,

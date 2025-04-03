@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/log/check.h"
+#include "absl/strings/string_view.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -35,7 +36,7 @@ limitations under the License.
 #include "mlir/Transforms/DialectConversion.h"
 #include "shardy/dialect/sdy/ir/dialect.h"
 #include "shardy/dialect/sdy/ir/utils.h"
-#include "xla/mlir_hlo/mhlo/IR/hlo_ops.h"
+#include "stablehlo/dialect/StablehloOps.h"
 #include "xla/service/spmd/shardy/constants.h"
 #include "xla/service/spmd/shardy/utils.h"
 #include "xla/sharding_op_util.h"
@@ -47,11 +48,11 @@ namespace {
 
 using ::mlir::IntegerAttr;
 using ::mlir::StringRef;
-using ::mlir::mhlo::CustomCallOp;
 using ::mlir::sdy::ShardingConstraintOp;
 using ::mlir::sdy::ShardingGroupOp;
 using ::mlir::sdy::TensorShardingAttr;
-using ::mlir::mhlo::CustomCallOpAdaptor;
+using ::mlir::stablehlo::CustomCallOp;
+using ::mlir::stablehlo::CustomCallOpAdaptor;
 
 mlir::LogicalResult rewriteShardingCustomCall(
     CustomCallOp op, CustomCallOpAdaptor adaptor,
@@ -60,9 +61,10 @@ mlir::LogicalResult rewriteShardingCustomCall(
 
   std::vector<int64_t> unspecDims;
   if (std::optional<mlir::Attribute> backendConfig = op.getBackendConfig()) {
+    StringRef configStr =
+        mlir::dyn_cast<mlir::StringAttr>(*backendConfig).getValue();
     CHECK_OK(xla::sharding_op_util::ParseAttributes(
-        mlir::dyn_cast<mlir::StringAttr>(*backendConfig).getValue(),
-        &unspecDims));
+        absl::string_view(configStr.data(), configStr.size()), &unspecDims));
   }
 
   if (op->getNumResults() != 1) {

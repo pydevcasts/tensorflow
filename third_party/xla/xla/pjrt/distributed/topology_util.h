@@ -17,7 +17,6 @@ limitations under the License.
 #define XLA_PJRT_DISTRIBUTED_TOPOLOGY_UTIL_H_
 
 #include <string>
-#include <string_view>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -40,7 +39,7 @@ absl::StatusOr<std::string> GetBootIdString();
 // topology in the order they appear in the input. Otherwise leaves the global
 // IDs as they were in the local topologies..
 // TODO(phawkins): deprecate and remove assign_global_device_ids.
-absl::Status ExchangeTopologies(std::string_view platform, int node_id,
+absl::Status ExchangeTopologies(absl::string_view platform, int node_id,
                                 int num_nodes,
                                 absl::Duration get_local_topology_timeout,
                                 absl::Duration get_global_topology_timeout,
@@ -54,7 +53,7 @@ absl::Status ExchangeTopologies(std::string_view platform, int node_id,
 // Given a LocalTopologyProto object from each node, builds a
 // GlobalTopologyProto that describes all nodes. Steals the contents of the
 // LocalTopologyProtos.
-GlobalTopologyProto BuildGlobalTopology(
+absl::StatusOr<GlobalTopologyProto> BuildGlobalTopology(
     absl::Span<LocalTopologyProto> local_topologies,
     bool assign_global_device_ids);
 

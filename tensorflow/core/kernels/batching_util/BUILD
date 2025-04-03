@@ -123,8 +123,8 @@ cc_library(
         "//tensorflow/core/platform:thread_annotations",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
-        "@local_tsl//tsl/platform:criticality",
         "@local_tsl//tsl/profiler/lib:traceme",
+        "@local_xla//xla/tsl/platform:criticality",
     ],
 )
 
@@ -138,8 +138,8 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
-        "@local_tsl//tsl/platform:criticality",
         "@local_tsl//tsl/profiler/lib:traceme",
+        "@local_xla//xla/tsl/platform:criticality",
     ],
 )
 
@@ -209,19 +209,19 @@ cc_library(
         "//tensorflow/core:lib_proto_parsing",
         "//tensorflow/core:portable_gif_internal",
         "//tensorflow/core/lib/core:errors",
-        "//tensorflow/core/lib/core:status",
         "//tensorflow/core/platform:errors",
         "//tensorflow/core/platform:notification",
         "//tensorflow/core/platform:thread_annotations",
-        "//tensorflow/core/profiler/lib:connected_traceme",
-        "//tensorflow/core/profiler/lib:context_types_hdrs",
         "//tensorflow/core/profiler/lib:traceme",
         "//tensorflow/core/profiler/lib:traceme_encode",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/time",
-        "@local_tsl//tsl/platform:criticality",
         "@local_tsl//tsl/platform:errors",
+        "@local_tsl//tsl/profiler/lib:connected_traceme",
+        "@local_tsl//tsl/profiler/lib:context_types_hdrs",
+        "@local_tsl//tsl/profiler/lib:traceme",
+        "@local_xla//xla/tsl/platform:criticality",
     ],
 )
 
@@ -235,14 +235,15 @@ cc_library(
         ":batch_stats",
         ":periodic_function_dynamic",
         "//tensorflow/core:lib",
-        "//tensorflow/core/profiler/lib:connected_traceme",
-        "//tensorflow/core/profiler/lib:context_types_hdrs",
         "//tensorflow/core/profiler/lib:traceme",
         "//tensorflow/core/profiler/lib:traceme_encode",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/time",
-        "@local_tsl//tsl/platform:criticality",
+        "@local_tsl//tsl/profiler/lib:connected_traceme",
+        "@local_tsl//tsl/profiler/lib:context_types_hdrs",
+        "@local_tsl//tsl/profiler/lib:traceme",
+        "@local_xla//xla/tsl/platform:criticality",
     ],
     alwayslink = 1,
 )
@@ -255,6 +256,7 @@ tf_cc_test(
         ":batch_scheduler",
         ":batch_scheduler_utils",
         ":fake_clock_env",
+        ":input_split_metadata",
         ":shared_batch_scheduler",
         "//tensorflow/core:lib",
         "//tensorflow/core:protos_all_cc",
@@ -464,7 +466,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:optional",
-        "@local_tsl//tsl/platform:criticality",
+        "@local_xla//xla/tsl/platform:criticality",
     ],
 )
 
@@ -512,8 +514,8 @@ tf_cc_test(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
-        "@local_tsl//tsl/platform:criticality",
         "@local_tsl//tsl/platform:status",
+        "@local_xla//xla/tsl/platform:criticality",
     ],
 )
 

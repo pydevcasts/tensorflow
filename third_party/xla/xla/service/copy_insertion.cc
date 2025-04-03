@@ -20,6 +20,8 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -888,7 +890,7 @@ class ComputeRelativeLocation {
     // A proper solution would be to track output index in
     // LiveRangeRegions::InstructionInfo.
     if (use->parent() == def->parent() &&
-        def->parent()->IsConditionalBranchComputation() &&
+        !def->parent()->caller_instructions(HloOpcode::kConditional).empty() &&
         def == entry2.first && def->shape().IsTuple()) {
       VLOG(3) << "Setting interception for multi-output instruction inside "
                  "conditional branch: "
@@ -1644,7 +1646,7 @@ class CopyRemover {
       // the liverages at and after s_{x+1}, and it is safe to order all uses
       // of s_x before the definition of d_1, by checking the live range
       // constraints for each pair --- we cannot skip the later checks because
-      // the live range ordering is not guranteed to be transitive --- while it
+      // the live range ordering is not guaranteed to be transitive --- while it
       // may be ok to have lr_1 before lr_2, and lr_2 before lv_3 while merging
       // their buffers, it may not be ok to merge the buffers of lr_1 and lv_3,
       // because the exclusiveness relation of non-overlapping computations is
@@ -1693,6 +1695,8 @@ class CopyRemover {
               << copy_node.src->value->ToShortString() << ") in its buffer";
       bool live_range_before =
           // Live range of d_0, ..., d_{y-1} must be before s_0;
+          // Since copy_node.src is tail for this if branch, copy_node.src->next
+          // is s0 because the list is circularly linked.
           CheckLiveRangeBefore(Prev(*copy_node.dest), copy_node.src->next) &&
           // Live range of 'last_src' must be before next_dest d_{y+1}.
           CheckLiveRangeBefore(copy_node.src, Next(*copy_node.dest));
@@ -2093,20 +2097,35 @@ absl::Status CopyInsertion::AddCopiesForAsyncSendRecv(
     return absl::OkStatus();
   }
 
-  // For send/recv outside of the while loop, live times are disjoint. No copies
-  // needed.
-  HloComputation* while_body = start_op->parent();
-  if (!while_body->IsWhileBodyComputation()) return absl::OkStatus();
+  HloComputation* parent = start_op->parent();
+  // If a Send is feeded into a pipelined while-loop, we need to make a copy
+  // of the Send operand and use it in the Send.
+  if (start_op->opcode() == HloOpcode::kSend &&
+      unique_user->opcode() == HloOpcode::kTuple &&
+      unique_user->users().size() == 1 &&
+      unique_user->users().front()->opcode() == HloOpcode::kWhile) {
+    HloInstruction* operand = start_op->mutable_operand(0);
+    HloInstruction* copied_operand =
+        parent->AddInstruction(HloInstruction::CreateUnary(
+            operand->shape(), HloOpcode::kCopy, operand));
+    TF_RETURN_IF_ERROR(operand->ReplaceUseWith(start_op, copied_operand));
+    return absl::OkStatus();
+  }
+
+  // For other cases that send/recv are outside of the while loop, live times
+  // are disjoint. No copies are needed.
+  if (parent->caller_instructions(HloOpcode::kWhile).empty()) {
+    return absl::OkStatus();
+  }
 
   // Handle send case.
-  HloInstruction* done_op =
-      FindAsyncSendRecvDoneInWhileBody(while_body, start_op);
+  HloInstruction* done_op = FindAsyncSendRecvDoneInWhileBody(parent, start_op);
   // TODO(b/369589022): Disambiguate sync and async use of send/recv.
   if (done_op == nullptr) return absl::OkStatus();
   if (start_op->opcode() == HloOpcode::kSend) {
     HloInstruction* operand = start_op->mutable_operand(0);
     HloInstruction* copied_operand =
-        while_body->AddInstruction(HloInstruction::CreateUnary(
+        parent->AddInstruction(HloInstruction::CreateUnary(
             operand->shape(), HloOpcode::kCopy, operand));
     TF_RETURN_IF_ERROR(operand->ReplaceUseWith(start_op, copied_operand));
     TF_RETURN_IF_ERROR(done_op->AddControlDependencyTo(copied_operand));
@@ -2118,7 +2137,7 @@ absl::Status CopyInsertion::AddCopiesForAsyncSendRecv(
   PtrVec<HloInstruction*> done_op_users = done_op->users();
   ShapeTree<HloInstruction*> copies_added(done_op->shape());
   TF_ASSIGN_OR_RETURN(HloInstruction * done_op_copy,
-                      while_body->DeepCopyInstruction(
+                      parent->DeepCopyInstruction(
                           done_op, /*indices_to_copy=*/nullptr, &copies_added));
   for (auto [shape_index, instr] : copies_added) {
     if (instr != nullptr)

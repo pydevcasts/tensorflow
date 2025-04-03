@@ -24,10 +24,9 @@ limitations under the License.
 #include "absl/hash/hash.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
-#include "tsl/platform/logging.h"
-#include "tsl/platform/macros.h"
-#include "tsl/platform/types.h"
+#include "xla/tsl/platform/logging.h"
+#include "xla/tsl/platform/macros.h"
+#include "xla/tsl/platform/types.h"
 #include "tsl/profiler/lib/context_types.h"
 
 namespace tsl {
@@ -63,6 +62,8 @@ TF_CONST_INIT extern const absl::string_view kPythonTracerPlaneName;
 TF_CONST_INIT extern const absl::string_view kHostCpusPlaneName;
 // Name of XPlane that contains kTrace system calls.
 TF_CONST_INIT extern const absl::string_view kSyscallsPlaneName;
+// Name of XPlane that contains namescope stack tree.
+TF_CONST_INIT extern const absl::string_view kScopeRangeIdTreePlaneName;
 
 // Names of XLines that contain ML-level events.
 TF_CONST_INIT extern const absl::string_view kStepLineName;
@@ -71,11 +72,15 @@ TF_CONST_INIT extern const absl::string_view kTensorFlowOpLineName;
 TF_CONST_INIT extern const absl::string_view kXlaModuleLineName;
 TF_CONST_INIT extern const absl::string_view kXlaOpLineName;
 TF_CONST_INIT extern const absl::string_view kSparseCoreStepLineName;
+TF_CONST_INIT extern const absl::string_view kSparseCoreOpLineName;
+TF_CONST_INIT extern const absl::string_view kSparseCoreModuleLineName;
 TF_CONST_INIT extern const absl::string_view kXlaAsyncOpLineName;
 TF_CONST_INIT extern const absl::string_view kKernelLaunchLineName;
 TF_CONST_INIT extern const absl::string_view kSourceLineName;
 TF_CONST_INIT extern const absl::string_view kCounterEventsLineName;
 TF_CONST_INIT extern const absl::string_view kHostOffloadOpLineName;
+TF_CONST_INIT extern const absl::string_view kTensorCoreSyncFlagLineName;
+TF_CONST_INIT extern const absl::string_view kSparseCoreSyncsLineName;
 
 // GPU device vendors.
 TF_CONST_INIT extern const absl::string_view kDeviceVendorNvidia;
@@ -262,7 +267,9 @@ enum StatType {
   kFlops,
   kModelFlops,
   kBytesAccessed,
+  kRawBytesAccessed,
   kMemoryAccessBreakdown,
+  kShapeWithLayout,
   kSourceInfo,
   kModelName,
   kModelVersion,
@@ -286,9 +293,15 @@ enum StatType {
   kDevCapComputeCapMinor,
   kDevCapPeakTeraflopsPerSecond,
   kDevCapPeakHbmBwGigabytesPerSecond,
+  kDevCapPeakCmemRdBwGigabytesPerSecond,
+  kDevCapPeakCmemWrBwGigabytesPerSecond,
+  kDevCapPeakVmemRdBwGigabytesPerSecond,
+  kDevCapPeakVmemWrBwGigabytesPerSecond,
   kDevCapPeakSramRdBwGigabytesPerSecond,
   kDevCapPeakSramWrBwGigabytesPerSecond,
   kDevVendor,
+  kDevHasMegacore,
+  kDevHasMergedVmem,
   // Batching related.
   kBatchSizeAfterPadding,
   kPaddingAmount,
@@ -335,7 +348,11 @@ enum StatType {
   kSourceStack,
   kDeviceOffsetPs,
   kDeviceDurationPs,
-  kLastStatType = kDeviceDurationPs,
+  kScopeRangeId,
+  kCoreDetails,
+  kAllReduceId,
+  kAllReduceUniqueId,
+  kLastStatType = kAllReduceUniqueId,
 };
 
 enum MegaScaleStatType : uint8_t {
@@ -345,6 +362,8 @@ enum MegaScaleStatType : uint8_t {
   kMegaScaleNumActions,
   kMegaScaleCollectiveType,
   kMegaScaleInputSize,
+  kMegaScaleSendChannelId,
+  kMegaScaleRecvChannelId,
   kMegaScaleSlackUs,
   kMegaScaleActionType,
   kMegaScaleStartEndType,
@@ -353,6 +372,7 @@ enum MegaScaleStatType : uint8_t {
   kMegaScaleActionInputs,
   kMegaScaleTransferSource,
   kMegaScaleTransferDestinations,
+  kMegaScaleTransferDcnTopologyLevel,
   kMegaScaleBufferSizes,
   kMegaScaleComputeOperation,
   kMegaScaleChunk,
@@ -362,7 +382,9 @@ enum MegaScaleStatType : uint8_t {
   kMegaScaleNetworkTransportLatency,
   kMegaScaleTransmissionBudgetUs,
   kMegaScaleDelayBudgetUs,
-  kLastMegaScaleStatType = kMegaScaleDelayBudgetUs,
+  kMegaScaleHloModule,
+  kMegaScaleMultiSliceTopology,
+  kLastMegaScaleStatType = kMegaScaleMultiSliceTopology,
 };
 
 enum TaskEnvStatType {

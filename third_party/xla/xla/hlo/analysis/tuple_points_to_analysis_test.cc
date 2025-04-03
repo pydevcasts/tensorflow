@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/log/check.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -29,12 +30,12 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+#include "xla/hlo/testlib/test.h"
+#include "xla/hlo/testlib/test_helpers.h"
 #include "xla/literal_util.h"
 #include "xla/service/logical_buffer.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/test.h"
-#include "xla/test_helpers.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/logging.h"
 #include "tsl/platform/statusor.h"
@@ -406,9 +407,10 @@ TEST_F(TuplePointsToAnalysisTest, SendAndSendDone) {
   auto constant = builder.AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto token = builder.AddInstruction(HloInstruction::CreateToken());
-  auto send = builder.AddInstruction(
-      HloInstruction::CreateSend(constant, token, /*channel_id=*/0));
-  auto send_done = builder.AddInstruction(HloInstruction::CreateSendDone(send));
+  auto send = builder.AddInstruction(HloInstruction::CreateSend(
+      constant, token, /*channel_id=*/0, /*is_host_transfer=*/false));
+  auto send_done = builder.AddInstruction(HloInstruction::CreateSendDone(
+      send, send->channel_id(), /*is_host_transfer=*/false));
 
   BuildModuleAndRunAnalysis(builder.Build());
 
@@ -431,9 +433,11 @@ TEST_F(TuplePointsToAnalysisTest, RecvAndRecvDone) {
   // RecvDone forwards its operand tuple element at {0} to the output.
   auto builder = HloComputation::Builder(TestName());
   auto token = builder.AddInstruction(HloInstruction::CreateToken());
-  auto recv = builder.AddInstruction(HloInstruction::CreateRecv(
-      ShapeUtil::MakeShape(F32, {1, 2, 3}), token, /*channel_id=*/0));
-  auto recv_done = builder.AddInstruction(HloInstruction::CreateRecvDone(recv));
+  auto recv = builder.AddInstruction(
+      HloInstruction::CreateRecv(ShapeUtil::MakeShape(F32, {1, 2, 3}), token,
+                                 /*channel_id=*/0, /*is_host_transfer=*/false));
+  auto recv_done = builder.AddInstruction(HloInstruction::CreateRecvDone(
+      recv, recv->channel_id(), /*is_host_transfer=*/false));
 
   BuildModuleAndRunAnalysis(builder.Build());
 
@@ -694,6 +698,31 @@ HloModule FusionParam0OneUser
 ENTRY %FusionParam0OneUser (param0: (f32[8], f32[3])) -> f32[8] {
   %param0 = (f32[8]{0}, f32[3]{0}) parameter(0)
   ROOT %fusion = f32[8]{0} fusion((f32[8]{0}, f32[3]{0}) %param0), kind=kLoop, calls=%fused_computation
+}
+)";
+  Run(hlo_str, /*expected_num_users=*/1);
+}
+
+TEST_F(FusionPointsToAnalysisTest,
+       FusionParam0OneUserWithUnreachableInstructionInFusion) {
+  std::string hlo_str = R"(
+HloModule FusionParam0OneUser
+
+%fused_computation (param_1.2: (f32[8], f32[3], f32[7])) -> f32[8] {
+  %param_1.2 = (f32[8]{0}, f32[3]{0}, f32[7]{0}) parameter(0)
+  %get-tuple-element.1 = f32[8]{0} get-tuple-element(%param_1.2), index=0
+  %get-tuple-element.2 = f32[3]{0} get-tuple-element(%param_1.2), index=1
+  %get-tuple-element.3 = f32[7]{0} get-tuple-element(%param_1.2), index=2
+  %placeholder = f32[7]{0} custom-call(%get-tuple-element.3), custom_call_target="IntermediateBufferDummyConsumer", custom_call_has_side_effect=true
+  %constant.3 = f32[3]{0} constant({1, 1, 1})
+  %add.1 = f32[3]{0} add(f32[3]{0} %get-tuple-element.2, f32[3]{0} %constant.3)
+  %constant.2 = s32[] constant(0)
+  ROOT %dynamic-update-slice.1 = f32[8]{0} dynamic-update-slice(f32[8]{0} %get-tuple-element.1, f32[3]{0} %add.1, s32[] %constant.2)
+}
+
+ENTRY %FusionParam0OneUser (param0: (f32[8], f32[3], f32[7])) -> f32[8] {
+  %param0 = (f32[8]{0}, f32[3]{0}, f32[7]{0}) parameter(0)
+  ROOT %fusion = f32[8]{0} fusion(%param0), kind=kLoop, calls=%fused_computation
 }
 )";
   Run(hlo_str, /*expected_num_users=*/1);

@@ -21,7 +21,6 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -37,17 +36,22 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/ir/hlo_schedule.h"
+#include "xla/hlo/pass/hlo_pass_interface.h"
+#include "xla/hlo/testlib/filecheck.h"
+#include "xla/hlo/testlib/verified_hlo_module.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/service/backend.h"
 #include "xla/service/gpu/gpu_compiler.h"
+#include "xla/service/gpu/gpu_latency_hiding_scheduler.h"
+#include "xla/service/gpu/transforms/scheduling_instruction_annotator.h"
 #include "xla/service/hlo_module_config.h"
+#include "xla/service/latency_hiding_scheduler.h"
+#include "xla/service/legalize_scheduling_annotations.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/device_description.h"
-#include "xla/tests/filecheck.h"
 #include "xla/tests/hlo_test_base.h"
 #include "xla/tests/test_utils.h"
-#include "xla/tests/verified_hlo_module.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "tsl/platform/status.h"
 #include "tsl/platform/status_matchers.h"
@@ -58,6 +62,7 @@ namespace xla {
 namespace gpu {
 
 using ::testing::ElementsAre;
+using ::testing::HasSubstr;
 using ::tsl::testing::StatusIs;
 
 class GpuHloScheduleTest : public HloTestBase {
@@ -76,24 +81,31 @@ class GpuHloScheduleTest : public HloTestBase {
     return SequentialHloOrdering{module->schedule()};
   }
 
-  HloModuleConfig GetModuleConfig(bool enable_latency_hiding_scheduler,
-                                  bool enable_gpu_async_tracker = false,
-                                  absl::string_view fdo_profile = "") {
+  struct TestConfig {
+    bool enable_latency_hiding_scheduler = false;
+    bool enable_pipelined_p2p = false;
+    std::string fdo_profile = "";
+  };
+
+  HloModuleConfig GetModuleConfig(const TestConfig test_config) {
     HloModuleConfig config;
     DebugOptions debug_options = GetDebugOptionsForTest();
     debug_options.set_xla_gpu_enable_latency_hiding_scheduler(
-        enable_latency_hiding_scheduler);
-    debug_options.set_xla_gpu_lhs_enable_gpu_async_tracker(
-        enable_gpu_async_tracker);
+        test_config.enable_latency_hiding_scheduler);
+    debug_options.set_xla_gpu_enable_pipelined_p2p(
+        test_config.enable_pipelined_p2p);
     config.set_debug_options(debug_options);
-    *config.mutable_fdo_profile() = fdo_profile;
+    config.set_fdo_profile(test_config.fdo_profile);
     return config;
   }
 
   std::unique_ptr<HloModule> CreateNewVerifiedModule(
       bool enable_latency_hiding_scheduler = false) {
-    return std::make_unique<HloModule>(
-        "test_module", GetModuleConfig(enable_latency_hiding_scheduler));
+    TestConfig test_config;
+    test_config.enable_latency_hiding_scheduler =
+        enable_latency_hiding_scheduler;
+    return std::make_unique<HloModule>("test_module",
+                                       GetModuleConfig(test_config));
   }
 
   static bool HasValidFingerprint(HloModule* module) {
@@ -103,6 +115,53 @@ class GpuHloScheduleTest : public HloTestBase {
 
     // The fingerprint is 128 bits stored as a hex string (128/4 hex digits).
     return it != attrs.map().end() && it->second.size() == 128 / 4;
+  }
+
+  // Run the gpu hlo scheduler and latency hiding scheduler
+  absl::StatusOr<bool> RunGpuLatencyHidingScheduler(HloModule* module,
+                                                    uint64_t memory_limit) {
+    HloModuleConfig default_config = GetModuleConfig({});
+    auto* gpu_compiler = dynamic_cast<GpuCompiler*>(backend().compiler());
+    EXPECT_NE(gpu_compiler, nullptr);
+    const int64_t pointer_size = gpu_compiler->GetPointerSize();
+
+    auto shape_size_in_bytes = ShapeSizeBytesFunction(pointer_size);
+
+    int64_t initial_peak_memory = -1;
+    TF_ASSIGN_OR_RETURN(HloSchedule initial_schedule,
+                        ScheduleGpuModuleWithMemoryScheduler(
+                            module, pointer_size, &initial_peak_memory));
+
+    TF_CHECK_OK(module->set_schedule(std::move(initial_schedule)));
+
+    SchedulerConfig config;
+    config.memory_limit = memory_limit;
+
+    auto estimator = std::make_unique<ApproximateLatencyEstimator>();
+    auto async_tracker = std::make_unique<GpuAsyncTracker>(config);
+    auto tracker_ptr = async_tracker.get();
+    auto scheduler_core = std::make_unique<DefaultSchedulerCore>(
+        shape_size_in_bytes, tracker_ptr, estimator.get(), config,
+        /*target_scheduling_rule=*/nullptr,
+        /*early_target_scheduling_rule=*/nullptr,
+        /*post_processing_fn=*/nullptr,
+        /*scheduling_instruction_crosses_overlap_limit=*/
+        GpuScheduleCrossesOverlapLimit);
+
+    HloPassPipeline pipeline("latency-hiding-scheduler");
+    // Only run latency hiding scheduling if the memory limit is positive
+    // to avoid out of memory
+    if (memory_limit > 0) {
+      pipeline.AddPass<LatencyHidingScheduler>(
+          std::move(estimator), std::move(async_tracker),
+          std::move(scheduler_core), shape_size_in_bytes);
+      return pipeline.Run(module);
+    } else {
+      return Internal(
+          "The byte size of input/output arguments exceeds the "
+          "base limit. This indicates an error in the calculation!");
+    }
+    return true;
   }
 };
 
@@ -318,10 +377,11 @@ TEST_F(GpuHloScheduleTest, LHSCostModel) {
     ROOT t = (f32[32], f32[32], f32[32,32]) tuple(ar-done, ar-done1, add5)
   })";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          hlo_text, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true)));
+      ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
   SequentialHloOrdering order = BuildHloOrdering(module.get());
 
   // With a better cost model, the latency hiding scheduler should distribute
@@ -361,10 +421,11 @@ TEST_F(GpuHloScheduleTest,
       custom_call_target="__cublas$gemm"
   })";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          kHloText, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true)));
+      ParseAndReturnVerifiedModule(kHloText, GetModuleConfig(test_config)));
   int64_t pointer_size =
       dynamic_cast<GpuCompiler*>(backend().compiler())->GetPointerSize();
   int64_t peak_memory_bytes = -1;
@@ -402,10 +463,11 @@ TEST_F(GpuHloScheduleTest, LHSCostModelCostlyAR) {
     ROOT t = (bf16[32505856], f32[32,32]) tuple(ar-done, dot6)
   })";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          hlo_text, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true)));
+      ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
   SequentialHloOrdering order = BuildHloOrdering(module.get());
 
   HloComputation* entry = module->entry_computation();
@@ -495,12 +557,12 @@ TEST_F(GpuHloScheduleTest, ProfileGuidedCostModel) {
   subtests.push_back({profile.SerializeAsString(), "ar-start1", "ar-done1"});
 
   for (const SubTest& subtest : subtests) {
+    TestConfig test_config;
+    test_config.enable_latency_hiding_scheduler = true;
+    test_config.fdo_profile = subtest.profile;
     TF_ASSERT_OK_AND_ASSIGN(
         auto module,
-        ParseAndReturnVerifiedModule(
-            hlo_text, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true,
-                                      /*enable_gpu_async_tracker=*/true,
-                                      /*fdo_profile=*/subtest.profile)));
+        ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
     SequentialHloOrdering order = BuildHloOrdering(module.get());
 
     HloComputation* entry = module->entry_computation();
@@ -557,12 +619,12 @@ TEST_F(GpuHloScheduleTest, ProfileGuidedCostModelFailsWithIncompleteProfile) {
     costs { name: "ar-start" cost_us: 1000.0 }
   )pb";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  test_config.fdo_profile = kProfile;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          kHloString, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true,
-                                      /*enable_gpu_async_tracker=*/true,
-                                      /*fdo_profile=*/kProfile)));
+      ParseAndReturnVerifiedModule(kHloString, GetModuleConfig(test_config)));
 
   HloModuleConfig config(module->config());
   DebugOptions dboptions(config.debug_options());
@@ -617,12 +679,12 @@ TEST_F(
     costs { name: "ar-start" cost_us: 1000.0 }
   )pb";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  test_config.fdo_profile = kProfile;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          kHloString, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true,
-                                      /*enable_gpu_async_tracker=*/true,
-                                      /*fdo_profile=*/kProfile)));
+      ParseAndReturnVerifiedModule(kHloString, GetModuleConfig(test_config)));
 
   // `dot1` and `ar-start1` are missing from the profile but we disable the
   // pass.
@@ -674,13 +736,12 @@ TEST_F(GpuHloScheduleTest, ProfileGuidedCostModelWithRematData) {
     costs { name: "ar-start1" cost_us: 1.0 }
     costs { name: "ar-start.remat100" cost_us: 2000.0 }
   )pb";
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  test_config.fdo_profile = ar_long_latency_proto_text;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          hlo_text,
-          GetModuleConfig(/*enable_latency_hiding_scheduler=*/true,
-                          /*enable_gpu_async_tracker=*/true,
-                          /*fdo_profile=*/ar_long_latency_proto_text)));
+      ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
   SequentialHloOrdering order = BuildHloOrdering(module.get());
 
   HloComputation* entry = module->entry_computation();
@@ -759,14 +820,17 @@ TEST_F(GpuHloScheduleTest, LHSSendRecv) {
     while_init = (u32[], f32[1, 1024, 1024]) tuple(c0, init)
     while_result = (u32[], f32[1, 1024, 1024]) while(while_init),
       body=while_body, condition=while_cond
-    ROOT entry_result = f32[1, 1024, 1024] get-tuple-element(while_result), index=1
+    ROOT entry_result = f32[1, 1024, 1024] get-tuple-element(while_result),
+      index=1
   }
   )";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  test_config.enable_pipelined_p2p = true;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          hlo_text, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true)));
+      ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
   SequentialHloOrdering order = BuildHloOrdering(module.get());
   HloComputation* while_body = module->GetComputationWithName("while_body");
   const std::vector<HloInstruction*>& instruction_sequence =
@@ -855,11 +919,12 @@ TEST_F(GpuHloScheduleTest, LHSSendRecvPairs2) {
   }
   )";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  test_config.enable_pipelined_p2p = true;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          hlo_text, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true,
-                                    /*enable_gpu_async_tracker=*/true)));
+      ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
   SequentialHloOrdering order = BuildHloOrdering(module.get());
   HloComputation* while_body = module->GetComputationWithName("while_body");
   const std::vector<HloInstruction*>& instruction_sequence =
@@ -950,11 +1015,12 @@ TEST_F(GpuHloScheduleTest, LHSSendRecvAllReduce) {
   }
   )";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  test_config.enable_pipelined_p2p = true;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          hlo_text, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true,
-                                    /*enable_gpu_async_tracker=*/true)));
+      ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
   SequentialHloOrdering order = BuildHloOrdering(module.get());
   HloComputation* while_body = module->GetComputationWithName("while_body");
   const std::vector<HloInstruction*>& instruction_sequence =
@@ -1070,11 +1136,12 @@ TEST_F(GpuHloScheduleTest, LHSSendRecvPipelined1) {
   }
   )";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  test_config.enable_pipelined_p2p = true;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          hlo_text, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true,
-                                    /*enable_gpu_async_tracker=*/true)));
+      ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
   SequentialHloOrdering order = BuildHloOrdering(module.get());
   const std::vector<HloInstruction*>& while_body =
       order.SequentialOrder(*module->GetComputationWithName("while_body"))
@@ -1095,7 +1162,7 @@ TEST_F(GpuHloScheduleTest, LHSSendRecvPipelined1) {
 
   // The pipelined Send-Recv in the main. A pipelined Recv is scheduled right
   // after its corresponding Send due to kForceEarly.
-  EXPECT_EQ(get_index("recv.2", main) + 1, get_index("send.2", main));
+  EXPECT_EQ(get_index("recv.2", main) + 3, get_index("send.2", main));
   EXPECT_LT(get_index("send.2", main), get_index("recv-done.2", main));
   EXPECT_LT(get_index("recv-done.2", main), get_index("send-done.2", main));
   EXPECT_LT(get_index("send-done.2", main), get_index("while-result", main));
@@ -1264,11 +1331,12 @@ TEST_F(GpuHloScheduleTest, LHSSendRecvPipelined2) {
   }
   )";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  test_config.enable_pipelined_p2p = true;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          hlo_text, GetModuleConfig(/*enable_latency_hiding_scheduler=*/true,
-                                    /*enable_gpu_async_tracker=*/true)));
+      ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
   SequentialHloOrdering order = BuildHloOrdering(module.get());
   const std::vector<HloInstruction*>& while_body =
       order.SequentialOrder(*module->GetComputationWithName("while_body"))
@@ -1289,7 +1357,7 @@ TEST_F(GpuHloScheduleTest, LHSSendRecvPipelined2) {
   EXPECT_TRUE(HasValidFingerprint(module.get()));
   // The pipelined Send-Recv in the main. A pipelined Recv is scheduled right
   // after its corresponding Send due to kForceEarly.
-  EXPECT_EQ(get_index("recv.2", main) + 1, get_index("send.2", main));
+  EXPECT_EQ(get_index("recv.2", main) + 3, get_index("send.2", main));
   EXPECT_LT(get_index("send.2", main), get_index("recv.3", main));
   EXPECT_EQ(get_index("recv.3", main) + 1, get_index("send.3", main));
   EXPECT_LT(get_index("send.3", main), get_index("recv-done.2", main));
@@ -1386,15 +1454,13 @@ TEST_F(GpuHloScheduleTest, ProfileGuidedCostModelWithForceEarliestSchedule) {
       ar_long_latency_proto_text, &profile));
   std::string ar_long_latency_proto_binary = profile.SerializeAsString();
 
+  // Post processing should work even with GpuAsyncTrackerBase.
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  test_config.fdo_profile = ar_long_latency_proto_binary;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          hlo_text,
-          GetModuleConfig(/*enable_latency_hiding_scheduler=*/true,
-                          // Post processing should work even with
-                          // GpuAsyncTrackerBase.
-                          /*enable_gpu_async_tracker=*/false,
-                          /*fdo_profile=*/ar_long_latency_proto_binary)));
+      ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
   SequentialHloOrdering order = BuildHloOrdering(module.get());
 
   const std::vector<HloInstruction*>& main =
@@ -1495,7 +1561,7 @@ TEST_P(GpuHloScheduleParameterizedTest, AsyncAllReduce) {
   EXPECT_TRUE(HasValidFingerprint(module.get()));
 }
 
-TEST_P(GpuHloScheduleParameterizedTest, LHSResourceModel) {
+TEST_F(GpuHloScheduleTest, LHSResourceModel) {
   const char* hlo_text = R"(
   HloModule AsyncModule
   apply_op {
@@ -1534,20 +1600,13 @@ TEST_P(GpuHloScheduleParameterizedTest, LHSResourceModel) {
     ROOT t = (f32[32], f32[64], f32[32,32]) tuple(ar-done, %ag-done, add5)
   })";
 
-  const bool enable_gpu_async_tracker = GetParam();
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
   TF_ASSERT_OK_AND_ASSIGN(
       auto module,
-      ParseAndReturnVerifiedModule(
-          hlo_text,
-          GetModuleConfig(
-              /*enable_latency_hiding_scheduler=*/true,
-              /*enable_gpu_async_tracker=*/enable_gpu_async_tracker)));
+      ParseAndReturnVerifiedModule(hlo_text, GetModuleConfig(test_config)));
   SequentialHloOrdering order = BuildHloOrdering(module.get());
 
-  // Count the number of collectives in flight. Without gpu async tracker, we
-  // will incorrectly have 2 in-flight (as base async tracker assumes each
-  // collective can be scheduled independently as they use different resource
-  // types), but with gpu async tracker we will have 1.
   uint32_t in_flight = 0;
   uint32_t max_in_flight = 0;
   for (const HloInstruction* inst :
@@ -1560,8 +1619,7 @@ TEST_P(GpuHloScheduleParameterizedTest, LHSResourceModel) {
     }
   }
 
-  const uint32_t expected_max_in_flight = enable_gpu_async_tracker ? 1 : 2;
-  EXPECT_EQ(expected_max_in_flight, max_in_flight);
+  EXPECT_EQ(max_in_flight, 1);
   EXPECT_TRUE(HasValidFingerprint(module.get()));
 }
 
@@ -1606,7 +1664,7 @@ TEST_F(GpuHloSchedulePostProcessTest, PostProcessAsyncCollectives) {
       module->schedule().sequence(module->entry_computation());
   HloInstructionSequence result = PostProcessSchedule(input);
 
-  const std::vector<std::string_view> expected_sequence = {
+  const std::vector<absl::string_view> expected_sequence = {
       "p0",
       "ar-start",  // ar-start is async, should be scheduled as early as
                    // possible.
@@ -1680,11 +1738,11 @@ TEST_F(GpuHloScheduleTest, CopyStartDoneScheduled) {
       ROOT add.0 = f32[512,1024]{1,0} add(copy-done.3, tanh.14)
   })";
 
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
   TF_ASSERT_OK_AND_ASSIGN(
-      auto module,
-      ParseAndReturnVerifiedModule(
-          kHloCopyStartDone,
-          GetModuleConfig(/*enable_latency_hiding_scheduler=*/true)));
+      auto module, ParseAndReturnVerifiedModule(kHloCopyStartDone,
+                                                GetModuleConfig(test_config)));
   TF_CHECK_OK(ScheduleGpuModule(
                   module.get(), /*pointer_size=*/8,
                   backend().default_stream_executor()->GetDeviceDescription())
@@ -1695,6 +1753,118 @@ TEST_F(GpuHloScheduleTest, CopyStartDoneScheduled) {
 // CHECK: tanh.14 = f32[512,1024]{1,0} tanh
 // CHECK: copy-done.3 = f32[512,1024]{1,0} copy-done
 )"));
+}
+
+// This test verifies that the GPU scheduler doesn't count CPU memory usage
+// in the GPU peak memory usage.
+TEST_F(GpuHloScheduleTest, DiscountCPUMemoryFromGPUPeakMemoryUsage) {
+  constexpr absl::string_view kPeakMemoryUsageWithCpuOffload = R"(
+  HloModule offloading, input_output_alias= { {0}: (1, {}, must-alias) }
+
+  ENTRY main {
+    param.0 = f32[1024]{0:S(5)} parameter(0)
+    param.1 = f32[1024]{0} parameter(1)
+    copy-start.h2d = (f32[1024]{0}, f32[1024]{0:S(5)}, u32[]) copy-start(param.0)
+    copy-done.h2d = f32[1024]{0} copy-done(copy-start.h2d)
+    copy-start.d2h = (f32[1024]{0:S(5)}, f32[1024]{0}, u32[]) copy-start(param.1)
+    copy-done.d2h = f32[1024]{0:S(5)} copy-done(copy-start.d2h)
+    ROOT t = (f32[1024]{0}, f32[1024]{0:S(5)}) tuple(copy-done.h2d, copy-done.d2h)
+  })";
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module, ParseAndReturnVerifiedModule(kPeakMemoryUsageWithCpuOffload,
+                                                GetModuleConfig({})));
+  int64_t pointer_size =
+      dynamic_cast<GpuCompiler*>(backend().compiler())->GetPointerSize();
+  int64_t peak_memory_bytes = -1;
+  TF_ASSERT_OK_AND_ASSIGN(auto schedule,
+                          ScheduleGpuModuleWithMemoryScheduler(
+                              module.get(), pointer_size, &peak_memory_bytes));
+  TF_CHECK_OK(module->set_schedule(std::move(schedule)));
+  // Expected size = 4096 (buffer size) + 24 (tuple size) + 4 (prefetch index)
+  EXPECT_LT(peak_memory_bytes, 4200);
+
+  // Let's verify that we store one parameter on the CPU first before loading
+  // another parameter from the CPU to minimize peak memory usage.
+  EXPECT_TRUE(*RunFileCheck(module->ToString(), R"(
+// CHECK: ENTRY
+// CHECK: copy-start.d2h = (f32[1024]{0:S(5)}, f32[1024]{0}, u32[]) copy-start
+// CHECK: copy-done.d2h = f32[1024]{0:S(5)} copy-done
+// CHECK: copy-start.h2d = (f32[1024]{0}, f32[1024]{0:S(5)}, u32[]) copy-start
+// CHECK: copy-done.h2d = f32[1024]{0} copy-done
+)"));
+}
+
+constexpr absl::string_view kCopyStartOverlap = R"(
+  HloModule conv_offloading
+  ENTRY %main (param_0: f32[1024], param_1: f32[1024]) -> f32[1024] {
+    %param_1 = f32[1024]{0} parameter(1)
+    %param_0 = f32[1024]{0} parameter(0)
+    %res_3 = f32[1024]{0} add(f32[1024]{0} %param_0, f32[1024]{0} %param_1)
+    %copy-start = (f32[1024]{0:S(5)}, f32[1024]{0}, u32[]) copy-start(f32[1024]{0} %res_3)
+    %copy-done = f32[1024]{0:S(5)} copy-done((f32[1024]{0:S(5)}, f32[1024]{0}, u32[]) %copy-start)
+    %res_4 = f32[1024]{0} tanh(f32[1024]{0} %res_3)
+    %copy-start.2 = (f32[1024]{0:S(5)}, f32[1024]{0}, u32[]) copy-start(f32[1024]{0} %res_4)
+    %copy-done.2 = f32[1024]{0:S(5)} copy-done((f32[1024]{0:S(5)}, f32[1024]{0}, u32[]) %copy-start.2)
+    %res_5 = f32[1024]{0} tanh(f32[1024]{0} %res_4)
+    %res_6 = f32[1024]{0} tanh(f32[1024]{0} %res_5)
+    %res_7 = f32[1024]{0} add(f32[1024]{0} %res_6, f32[1024]{0} %res_6)
+    %copy-start.1 = (f32[1024]{0}, f32[1024]{0:S(5)}, u32[]) copy-start(f32[1024]{0:S(5)} %copy-done)
+    %copy-done.1 = f32[1024]{0} copy-done((f32[1024]{0}, f32[1024]{0:S(5)}, u32[]) %copy-start.1)
+    %res_8 = f32[1024]{0} add(f32[1024]{0} %res_7, f32[1024]{0} %res_5)
+    %copy-start.3 = (f32[1024]{0}, f32[1024]{0:S(5)}, u32[]) copy-start(f32[1024]{0:S(5)} %copy-done.2)
+    %copy-done.3 = f32[1024]{0} copy-done((f32[1024]{0}, f32[1024]{0:S(5)}, u32[]) %copy-start.3)
+    %res_9 = f32[1024]{0} add(f32[1024]{0} %res_8, f32[1024]{0} %copy-done.3)
+    %res_10 = f32[1024]{0} add(f32[1024]{0} %res_9, f32[1024]{0} %copy-done.1)
+    ROOT %res_11 = f32[1024]{0} tanh(f32[1024]{0} %res_10)
+})";
+
+// This test ensures that the GPU scheduler applies latency hiding scheduling
+// while adhering to a specified memory limit.
+TEST_F(GpuHloScheduleTest, RunLHSToBeWithinMemoryLimit) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module,
+      ParseAndReturnVerifiedModule(kCopyStartOverlap, GetModuleConfig({})));
+
+  // Define a large memory limit for the scheduler.
+  constexpr uint64_t kMemoryLimitLarge = 22000;
+
+  // Run the latency hiding scheduler with the specified memory limit.
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunGpuLatencyHidingScheduler(
+                                            module.get(), kMemoryLimitLarge));
+
+  EXPECT_TRUE(changed);
+
+  EXPECT_TRUE(*RunFileCheck(module->ToString(), R"(
+// CHECK: ENTRY
+// CHECK: %copy-start.2 = (f32[1024]{0:S(5)}, f32[1024]{0}, u32[]) copy-start
+// CHECK: %copy-start = (f32[1024]{0:S(5)}, f32[1024]{0}, u32[]) copy-start
+// CHECK: %copy-done.2 = f32[1024]{0:S(5)} copy-done
+// CHECK: %copy-start.3 = (f32[1024]{0}, f32[1024]{0:S(5)}, u32[]) copy-start
+// CHECK: %copy-done = f32[1024]{0:S(5)} copy-done
+// CHECK: %copy-start.1 = (f32[1024]{0}, f32[1024]{0:S(5)}, u32[]) copy-start
+// CHECK: %copy-done.3 = f32[1024]{0} copy-done
+// CHECK: %copy-done.1 = f32[1024]{0} copy-done
+)"));
+}
+
+// This test verifies that the GPU scheduler doesn't run latency hiding
+// scheduling if the given memory limit is negative.
+TEST_F(GpuHloScheduleTest, NegativeTestMemoryLimit) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module,
+      ParseAndReturnVerifiedModule(kCopyStartOverlap, GetModuleConfig({})));
+
+  constexpr uint64_t kMemoryLimitNeg = 0;
+
+  // Run latency hiding scheduler with a negative memory limit
+  auto status =
+      RunGpuLatencyHidingScheduler(module.get(), kMemoryLimitNeg).status();
+  EXPECT_FALSE(status.ok());
+  EXPECT_THAT(
+      status.message(),
+      HasSubstr("The byte size of input/output arguments exceeds the "
+                "base limit. This indicates an error in the calculation!"));
 }
 
 }  // namespace gpu

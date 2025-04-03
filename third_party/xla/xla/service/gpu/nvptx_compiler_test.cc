@@ -35,10 +35,10 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/tests/hlo_test_base.h"
 #include "xla/tsl/lib/core/status_test_util.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla.pb.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace gpu {
@@ -74,7 +74,7 @@ class NVPTXCompilerTest : public HloTestBase {
 
     auto buffer_size_bytes_function =
         [](const BufferValue& buffer_value) -> int64_t {
-      return GetSizeOfShape(buffer_value.shape(), pointer_size);
+      return ShapeSizeBytesFunction(pointer_size)(buffer_value.shape());
     };
 
     return BufferAssigner::Run(

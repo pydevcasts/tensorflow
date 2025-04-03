@@ -16,13 +16,17 @@ limitations under the License.
 #ifndef XLA_SERVICE_INSTRUCTION_FUSION_H_
 #define XLA_SERVICE_INSTRUCTION_FUSION_H_
 
+#include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -42,6 +46,14 @@ limitations under the License.
 
 namespace xla {
 
+// In the context of ShouldFuseInPlaceOp (refer to the documentation there), the
+// number of non-elementwise ops in the producer fusion is limited to 1.
+// However, there are cases where we want to relax this restriction. This struct
+// provides the necessary options to control this behavior.
+struct InPlaceFusionOptions {
+  bool relax_multiple_non_elementwise_ops = false;
+};
+
 // Propagating explanation of fusion decisions: if something could not be fused,
 // explain the reason.
 class FusionDecision {
@@ -57,6 +69,12 @@ class FusionDecision {
   FusionDecision(bool condition, absl::string_view explanation) {
     if (!condition) {
       explanation_ = std::string(explanation);
+    }
+  }
+
+  explicit FusionDecision(absl::Status status) {
+    if (!status.ok()) {
+      explanation_ = status.message();
     }
   }
 
@@ -169,8 +187,9 @@ class InstructionFusion : public HloModulePass {
   // illegal to fuse a slice into a dynamic-update-slice if the slice output is
   // used as the update and if slice and dynamic-update-slice indices cannot be
   // proven to be the same.
-  static FusionDecision ShouldFuseInPlaceOp(const HloInstruction* producer,
-                                            const HloInstruction* consumer);
+  static FusionDecision ShouldFuseInPlaceOp(
+      const HloInstruction* producer, const HloInstruction* consumer,
+      std::optional<const InPlaceFusionOptions> in_place_fusion_options);
 
  protected:
   // Returns a list of computations that are not fusion computations. These
@@ -205,8 +224,8 @@ class InstructionFusion : public HloModulePass {
   // updates an operand in place.
   virtual FusionDecision ShouldFuse(
       HloInstruction* consumer, int64_t operand_index,
-      std::function<FusionDecision(const HloInstruction*,
-                                   const HloInstruction*)>
+      std::function<FusionDecision(const HloInstruction*, const HloInstruction*,
+                                   std::optional<const InPlaceFusionOptions>)>
           inplace_op_fusion_decider);
 
   // Returns whether multi-output fusion can be applied to fuse `producer` into
@@ -264,11 +283,6 @@ class InstructionFusion : public HloModulePass {
       std::function<bool(const HloInstruction& instruction)> is_expensive) {
     is_expensive_ = is_expensive;
   }
-
-  // Whether multi-output fusion would introduce a cycle into the HLO graph.
-  bool MultiOutputFusionCreatesCycle(HloInstruction* producer,
-                                     HloInstruction* consumer,
-                                     const HloReachabilityMap& reachability);
 
   FusionConfigCollection config_collection_mode() {
     return config_collection_mode_;

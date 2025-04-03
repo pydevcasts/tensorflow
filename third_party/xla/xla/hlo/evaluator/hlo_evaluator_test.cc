@@ -46,7 +46,9 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/parser/hlo_parser.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+#include "xla/hlo/testlib/test.h"
 #include "xla/hlo/transforms/simplifiers/hlo_element_type_converter.h"
 #include "xla/layout_util.h"
 #include "xla/literal.h"
@@ -59,16 +61,15 @@ limitations under the License.
 #include "xla/service/shape_inference.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/test.h"
 #include "xla/tests/literal_test_util.h"
 #include "xla/tests/test_utils.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/platform/test.h"
+#include "xla/tsl/platform/test_benchmark.h"
 #include "xla/types.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
-#include "tsl/platform/test.h"
-#include "tsl/platform/test_benchmark.h"
 
 namespace xla {
 namespace {
@@ -2639,45 +2640,6 @@ TEST_F(HloEvaluatorPreciseReduceTest, AddReductionPrecisionTest) {
   LiteralTestUtil::ExpectR0Equal<float>(kNumElements, result);
 }
 
-// Reducing many numbers should be fast because it doesn't create
-// intermediate Literals; the microbenchmark should finish in < 1 msec.
-void BM_ReducePrecisely(::testing::benchmark::State& state) {
-  HloComputation::Builder b("BM_ReducePrecisely");
-  HloModuleConfig config;
-  config.set_debug_options(GetDebugOptionsFromFlags());
-  HloModule module("BM_ReducePrecisely", config);
-
-  constexpr int kNumElements = 1 << 25;  // float += 1 saturates at 1<<24
-  std::vector<float> v(kNumElements, 1.0f);
-  HloInstruction* arg_instruction = b.AddInstruction(
-      HloInstruction::CreateConstant(LiteralUtil::CreateR1<float>(v)));
-  auto init_value = b.AddInstruction(
-      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(0.f)));
-
-  HloComputation::Builder add_computation("add");
-  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
-  auto param_lhs = add_computation.AddInstruction(
-      HloInstruction::CreateParameter(0, scalar_shape, "lhs"));
-  auto param_rhs = add_computation.AddInstruction(
-      HloInstruction::CreateParameter(1, scalar_shape, "rhs"));
-  add_computation.AddInstruction(HloInstruction::CreateBinary(
-      scalar_shape, HloOpcode::kAdd, param_lhs, param_rhs));
-  auto add_func = module.AddEmbeddedComputation(add_computation.Build());
-
-  HloInstruction* reduce_instruction = b.AddInstruction(
-      HloInstruction::CreateReduce(scalar_shape, arg_instruction, init_value,
-                                   /*dimensions_to_reduce=*/{0}, add_func));
-  module.AddEntryComputation(b.Build());
-
-  // Benchmark loop
-  for (auto s : state) {
-    HloEvaluator hlo_eval;
-    hlo_eval.Evaluate(reduce_instruction).value();
-  }
-}
-
-BENCHMARK(BM_ReducePrecisely);
-
 TEST_P(HloEvaluatorBf16Test, ReduceAdd) {
   HloComputation::Builder b(TestName());
 
@@ -3432,6 +3394,23 @@ TEST_P(HloEvaluatorBf16Test, EvaluateWithSubstitutionsWithConstantOperand) {
       LiteralUtil::CreateR1<float>({11, 22, 33, 44}), result));
 }
 
+// Check that EvaluateWithSubstitutions works if the thing we're evaluating is
+// being substituted.
+TEST_P(HloEvaluatorBf16Test, EvaluateSubstitutedInstruction) {
+  HloComputation::Builder b(TestName());
+  Shape shape = ShapeUtil::MakeShape(F32, {4});
+
+  HloInstruction* param =
+      b.AddInstruction(HloInstruction::CreateParameter(0, shape, "param0"));
+
+  HloEvaluator evaluator;
+  Literal literal = LiteralUtil::CreateR1<float>({10, 20, 30, 40});
+  TF_ASSERT_OK_AND_ASSIGN(Literal result, evaluator.EvaluateWithSubstitutions(
+                                              param, {{param, &literal}}));
+  EXPECT_TRUE(LiteralTestUtil::Equal(
+      LiteralUtil::CreateR1<float>({10, 20, 30, 40}), result));
+}
+
 TEST_F(HloEvaluatorTest, EvaluateWithSubstitutionsLiteralBase) {
   HloComputation::Builder b(TestName());
   Shape shape = ShapeUtil::MakeShape(S64, {3});
@@ -3674,6 +3653,63 @@ ENTRY main {
   TF_ASSERT_OK_AND_ASSIGN(Literal result, Evaluate({&operand, &start_indices}));
   EXPECT_TRUE(LiteralTestUtil::Equal(
       LiteralUtil::CreateR2<int32_t>({{0, 1}, {2, 1}}), result));
+}
+
+TEST_F(HloEvaluatorTest, EvaluateGather_ExplicitBatchDims) {
+  const std::string hlo_text = R"(
+HloModule gather
+
+ENTRY main {
+  operand = s32[3,2,1,3] parameter(0)
+  indices = s32[3,2] parameter(1)
+  ROOT gather = s32[3,2,2] gather(operand, indices),
+      offset_dims={2},
+      collapsed_slice_dims={2},
+      start_index_map={0},
+      index_vector_dim=2,
+      slice_sizes={2,1,1,1},
+      operand_batching_dims={1,3},
+      start_indices_batching_dims={1,0}
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(m_, ParseAndReturnVerifiedModule(hlo_text));
+
+  Literal operand =
+      LiteralUtil::CreateR4<int32_t>({{{{1, 2, 3}}, {{4, 5, 6}}},
+                                      {{{7, 8, 9}}, {{10, 11, 12}}},
+                                      {{{13, 14, 15}}, {{16, 17, 18}}}});
+  Literal start_indices =
+      LiteralUtil::CreateR2<int32_t>({{1, 0}, {0, 1}, {1, 0}});
+  Literal expected_result = LiteralUtil::CreateR3<int32_t>(
+      {{{7, 13}, {4, 10}}, {{2, 8}, {11, 17}}, {{9, 15}, {6, 12}}});
+
+  TF_ASSERT_OK_AND_ASSIGN(Literal result, Evaluate({&operand, &start_indices}));
+  EXPECT_TRUE(LiteralTestUtil::Equal(expected_result, result));
+}
+
+TEST_F(HloEvaluatorTest, EvaluateGather_GetDiagonal) {
+  const std::string hlo_text = R"(
+HloModule module
+
+ENTRY %module {
+  %operand = f32[4,4] parameter(0)
+  %indices = s32[4,1] iota(), iota_dimension=0
+  ROOT %gather = f32[4,1] gather(%operand, %indices), offset_dims={},
+    collapsed_slice_dims={1}, start_index_map={1}, operand_batching_dims={0},
+    start_indices_batching_dims={0}, index_vector_dim=2, slice_sizes={1,1}
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(m_, ParseAndReturnVerifiedModule(hlo_text));
+
+  Literal operand = LiteralUtil::CreateR2<float>({{0.0, 0.1, 0.2, 0.3},
+                                                  {1.0, 1.1, 1.2, 1.3},
+                                                  {2.0, 2.1, 2.2, 2.3},
+                                                  {3.0, 3.1, 3.2, 3.3}});
+  Literal expected_result =
+      LiteralUtil::CreateR2<float>({{0.0}, {1.1}, {2.2}, {3.3}});
+
+  TF_ASSERT_OK_AND_ASSIGN(Literal result, Evaluate({&operand}));
+  EXPECT_TRUE(LiteralTestUtil::Equal(expected_result, result));
 }
 
 TEST_F(HloEvaluatorTest, EvaluateScatter_TensorFlowScatterV1_Update) {
@@ -4287,6 +4323,67 @@ ENTRY main {
   EXPECT_TRUE(LiteralTestUtil::Equal(expected, result));
 }
 
+TEST_F(HloEvaluatorTest, EvaluateScatter_ExplicitBatchDims) {
+  const char* hlo_text = R"(
+  HloModule ScatterExplicitBatchDims
+  add_s32 {
+    x = s32[] parameter(0)
+    y = s32[] parameter(1)
+    ROOT s = s32[] add(x,y)
+  }
+
+  ENTRY main {
+    indices = s32[2,3,5] parameter(0)
+    update = s32[2,3,2,5] parameter(1)
+    z = s32[] constant(0)
+    input = s32[5,3,2,2] broadcast(z), dimensions={}
+    ROOT s = s32[5,3,2,2] scatter(input, indices, update),
+      update_window_dims={2},
+      inserted_window_dims={1},
+      scatter_dims_to_operand_dims={1},
+      index_vector_dim=3,
+      input_batching_dims={0,3},
+      scatter_indices_batching_dims={2,0},
+      to_apply=add_s32
+  }
+)";
+  TF_ASSERT_OK_AND_ASSIGN(m_, ParseAndReturnVerifiedModule(hlo_text));
+  auto indices =
+      std::make_unique<Literal>(ShapeUtil::MakeShape(S32, {2, 3, 5}));
+  indices
+      ->Populate<int>([](absl::Span<const int64_t> indices) {
+        return static_cast<int>((indices[1] + 1) % 3);
+      })
+      .IgnoreError();
+  auto updates =
+      std::make_unique<Literal>(ShapeUtil::MakeShape(S32, {2, 3, 2, 5}));
+  updates
+      ->Populate<int>([](absl::Span<const int64_t> indices) {
+        return static_cast<int>(indices[0] * 1000 + indices[1] * 100 +
+                                indices[2] * 10 + indices[3]);
+      })
+      .IgnoreError();
+  Literal expected =
+      LiteralUtil::CreateR4<int32_t>({{{{200, 1200}, {210, 1210}},
+                                       {{0, 1000}, {10, 1010}},
+                                       {{100, 1100}, {110, 1110}}},
+                                      {{{201, 1201}, {211, 1211}},
+                                       {{1, 1001}, {11, 1011}},
+                                       {{101, 1101}, {111, 1111}}},
+                                      {{{202, 1202}, {212, 1212}},
+                                       {{2, 1002}, {12, 1012}},
+                                       {{102, 1102}, {112, 1112}}},
+                                      {{{203, 1203}, {213, 1213}},
+                                       {{3, 1003}, {13, 1013}},
+                                       {{103, 1103}, {113, 1113}}},
+                                      {{{204, 1204}, {214, 1214}},
+                                       {{4, 1004}, {14, 1014}},
+                                       {{104, 1104}, {114, 1114}}}});
+  TF_ASSERT_OK_AND_ASSIGN(Literal result,
+                          Evaluate({indices.get(), updates.get()}));
+  EXPECT_TRUE(LiteralTestUtil::Equal(expected, result));
+}
+
 // Verifies that HloEvaluator evaluates a HLO instruction that performs
 // element-wise comparison with 2 bfloat16 operands.
 TEST_F(HloEvaluatorTest, DoesCompareBF16) {
@@ -4448,6 +4545,71 @@ ENTRY main {
   }
 }
 
+TEST_P(HloEvaluatorBf16Test, BitcastWithoutLayout) {
+  const absl::string_view hlo_text_base = R"(
+HloModule Bitcast
+
+ENTRY main {
+  param = %s[2,4] parameter(0)
+  ROOT bitcast = %s[4,2,1] bitcast(%s[2,4] param)
+}
+)";
+  std::string hlo_text;
+  Literal arg;
+  if (use_bfloat16_) {
+    hlo_text = absl::StrFormat(hlo_text_base, "bf16", "bf16", "bf16");
+    arg = LiteralUtil::CreateR2<bfloat16>(
+        {{bfloat16(1), bfloat16(2), bfloat16(3), bfloat16(4)},
+         {bfloat16(5), bfloat16(6), bfloat16(7), bfloat16(8)}});
+  } else {
+    hlo_text = absl::StrFormat(hlo_text_base, "f32", "f32", "f32");
+    arg = LiteralUtil::CreateR2<float>({{1., 2., 3., 4.}, {5., 6., 7., 8.}});
+  }
+
+  HloParserOptions parser_config;
+  parser_config.set_fill_missing_layouts(false);
+  TF_ASSERT_OK_AND_ASSIGN(m_, ParseAndReturnUnverifiedModule(
+                                  hlo_text, HloModuleConfig(), parser_config));
+
+  absl::StatusOr<Literal> actual = Evaluate({&arg});
+  EXPECT_FALSE(actual.ok());
+  EXPECT_EQ(actual.status().message(),
+            "Evaluator cannot evaluate bitcast for non-scalar operand without "
+            "assigned layout.");
+}
+
+TEST_P(HloEvaluatorBf16Test, EffectiveScalarBitcastWithoutLayout) {
+  const absl::string_view hlo_text_base = R"(
+HloModule Bitcast
+
+ENTRY main {
+  param = %s[1,1] parameter(0)
+  ROOT bitcast = %s[1,1,1] bitcast(%s[1,1] param)
+}
+)";
+  std::string hlo_text;
+  Literal arg;
+  if (use_bfloat16_) {
+    hlo_text = absl::StrFormat(hlo_text_base, "bf16", "bf16", "bf16");
+    arg = LiteralUtil::CreateR2<bfloat16>({{bfloat16(2)}});
+  } else {
+    hlo_text = absl::StrFormat(hlo_text_base, "f32", "f32", "f32");
+    arg = LiteralUtil::CreateR2<float>({{2.}});
+  }
+
+  HloParserOptions parser_config;
+  parser_config.set_fill_missing_layouts(false);
+  TF_ASSERT_OK_AND_ASSIGN(m_, ParseAndReturnUnverifiedModule(
+                                  hlo_text, HloModuleConfig(), parser_config));
+
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, Evaluate({&arg}));
+  if (use_bfloat16_) {
+    EXPECT_TRUE(absl::c_equal(arg.data<bfloat16>(), actual.data<bfloat16>()));
+  } else {
+    EXPECT_TRUE(absl::c_equal(arg.data<float>(), actual.data<float>()));
+  }
+}
+
 // Check that s32 under/overflow doesn't trigger a ubsan failure.
 TEST_F(HloEvaluatorTest, Int32Overflow) {
   const absl::string_view hlo_text = R"(
@@ -4492,7 +4654,7 @@ ENTRY main {
   size = s32[] parameter(0)
 
   data = s32[4] parameter(1)
-  
+
   data_dynamic = s32[<=4] set-dimension-size(data, size), dimensions={0}
 
   sum = s32[<=4] add(data_dynamic, data)
@@ -5862,7 +6024,7 @@ TEST_F(PatternMatchParseWhileLoopTest, CopiedLoopCond) {
       %copy.0 = s32[] copy(s32[] %gte.0)
       %loop_bound = s32[] constant(5)
       %result = pred[] compare(%gte.0, %loop_bound), direction=LT
-      ROOT %copy.1 = pred[] copy(pred[] %result) 
+      ROOT %copy.1 = pred[] copy(pred[] %result)
     }
 
     %while_body {
@@ -6065,6 +6227,95 @@ TEST(EvalErrorTest, Payload) {
   EXPECT_EQ(internal::ParseEvalErrorDetail(s),
             internal::EvalErrorDetail::kDynamicValueDependence);
 }
+
+//===----------------------------------------------------------------------===//
+// Perfrormance benchmarks below.
+//===----------------------------------------------------------------------===//
+
+// Reducing many numbers should be fast because it doesn't create
+// intermediate Literals; the microbenchmark should finish in < 1 msec.
+void BM_ReducePrecisely(::testing::benchmark::State& state) {
+  HloComputation::Builder b("BM_ReducePrecisely");
+  HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsFromFlags());
+  HloModule module("BM_ReducePrecisely", config);
+
+  constexpr int kNumElements = 1 << 25;  // float += 1 saturates at 1<<24
+  std::vector<float> v(kNumElements, 1.0f);
+  HloInstruction* arg_instruction = b.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR1<float>(v)));
+  auto init_value = b.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(0.f)));
+
+  HloComputation::Builder add_computation("add");
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  auto param_lhs = add_computation.AddInstruction(
+      HloInstruction::CreateParameter(0, scalar_shape, "lhs"));
+  auto param_rhs = add_computation.AddInstruction(
+      HloInstruction::CreateParameter(1, scalar_shape, "rhs"));
+  add_computation.AddInstruction(HloInstruction::CreateBinary(
+      scalar_shape, HloOpcode::kAdd, param_lhs, param_rhs));
+  auto add_func = module.AddEmbeddedComputation(add_computation.Build());
+
+  HloInstruction* reduce_instruction = b.AddInstruction(
+      HloInstruction::CreateReduce(scalar_shape, arg_instruction, init_value,
+                                   /*dimensions_to_reduce=*/{0}, add_func));
+  module.AddEntryComputation(b.Build());
+
+  // Benchmark loop
+  for (auto s : state) {
+    HloEvaluator hlo_eval;
+    hlo_eval.Evaluate(reduce_instruction).value();
+  }
+}
+
+BENCHMARK(BM_ReducePrecisely);
+
+static void BM_UnaryOp(benchmark::State& state) {
+  int64_t d = state.range(0);
+
+  std::unique_ptr<HloInstruction> input =
+      HloInstruction::CreateConstant(LiteralUtil::CreateFull({d, d}, 1.0f));
+
+  std::unique_ptr<HloInstruction> unary = HloInstruction::CreateUnary(
+      ShapeUtil::MakeShape(F32, {d, d}), HloOpcode::kExp, input.get());
+
+  HloEvaluator evaluator;
+  for (auto s : state) {
+    CHECK_OK(evaluator.Evaluate(unary.get()).status());
+  }
+}
+
+BENCHMARK(BM_UnaryOp)
+    ->MeasureProcessCPUTime()
+    ->Arg(64)
+    ->Arg(128)
+    ->Arg(512)
+    ->Arg(1024);
+
+static void BM_BinaryOp(benchmark::State& state) {
+  int64_t d = state.range(0);
+
+  std::unique_ptr<HloInstruction> lhs =
+      HloInstruction::CreateConstant(LiteralUtil::CreateFull({d, d}, 1.0f));
+  std::unique_ptr<HloInstruction> rhs =
+      HloInstruction::CreateConstant(LiteralUtil::CreateFull({d, d}, 2.0f));
+
+  std::unique_ptr<HloInstruction> binary = HloInstruction::CreateBinary(
+      ShapeUtil::MakeShape(F32, {d, d}), HloOpcode::kAdd, lhs.get(), rhs.get());
+
+  HloEvaluator evaluator;
+  for (auto s : state) {
+    CHECK_OK(evaluator.Evaluate(binary.get()).status());
+  }
+}
+
+BENCHMARK(BM_BinaryOp)
+    ->MeasureProcessCPUTime()
+    ->Arg(64)
+    ->Arg(128)
+    ->Arg(512)
+    ->Arg(1024);
 
 }  // namespace
 }  // namespace xla

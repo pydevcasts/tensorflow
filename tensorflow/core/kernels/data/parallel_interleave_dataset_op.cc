@@ -19,9 +19,13 @@ limitations under the License.
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/strings/str_format.h"
 #include "tensorflow/core/common_runtime/function.h"
@@ -331,7 +335,7 @@ class ParallelInterleaveDatasetOp::Dataset : public DatasetBase {
         b->AddScalar(num_parallel_calls_, &num_parallel_calls_node));
     inputs.emplace_back(input_index++, num_parallel_calls_node);
 
-    std::vector<std::pair<StringPiece, AttrValue>> attrs;
+    std::vector<std::pair<absl::string_view, AttrValue>> attrs;
     AttrValue f;
     b->BuildAttrValue(captured_func_->func(), &f);
     attrs.emplace_back(kFunc, f);

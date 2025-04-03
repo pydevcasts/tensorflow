@@ -30,6 +30,8 @@ limitations under the License.
 #include "mlir/IR/OwningOpRef.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/tfrt/transforms/ifrt/ifrt_types.h"
 #include "xla/python/ifrt/future.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tensorflow/core/common_runtime/process_function_library_runtime.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/device_base.h"
@@ -40,6 +42,7 @@ limitations under the License.
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/types.pb.h"
+#include "tensorflow/core/platform/context.h"
 #include "tensorflow/core/tfrt/fallback/op_kernel_runner.h"
 #include "tensorflow/core/tfrt/ifrt/ifrt_loaded_variable_utils.h"
 #include "tensorflow/core/tfrt/ifrt/ifrt_restore_tensor_registry.h"
@@ -47,8 +50,6 @@ limitations under the License.
 #include "tensorflow/core/tfrt/mlrt/kernel/kernel_runner_utils.h"
 #include "tensorflow/core/tfrt/mlrt/kernel/shard_restore_util.h"
 #include "tensorflow/core/tfrt/utils/fallback_tensor.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
 #include "tsl/platform/tstring.h"
 #include "tfrt/host_context/concurrent_work_queue.h"  // from @tf_runtime
 
@@ -274,12 +275,14 @@ absl::Status RunShard(RestoreVariableShard shard,
   if (!use_async_restore) {
     RunShardHelper(runner, async_state.get(), shard);
   } else {
+    tensorflow::Context bg_context(tensorflow::ContextKind::kThread);
     // Use dedicated work queue for restore operation.
-    checkpoint_loader_work_queue->AddTask([runner = std::move(runner),
-                                           async_state = std::move(async_state),
-                                           shard = std::move(shard)]() {
-      RunShardHelper(runner, async_state.get(), shard);
-    });
+    checkpoint_loader_work_queue->AddTask(
+        [runner = std::move(runner), async_state = std::move(async_state),
+         shard = std::move(shard), bg_context = std::move(bg_context)]() {
+          tensorflow::WithContext wc(bg_context);
+          RunShardHelper(runner, async_state.get(), shard);
+        });
   }
 
   return absl::OkStatus();

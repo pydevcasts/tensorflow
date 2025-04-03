@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_SERVICE_HLO_MODULE_CONFIG_H_
 #define XLA_SERVICE_HLO_MODULE_CONFIG_H_
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,11 +26,16 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "xla/debug_options_flags.h"
 #include "xla/service/computation_layout.h"
 #include "xla/service/computation_placer.h"
 #include "xla/service/hlo.pb.h"
+#include "xla/service/sharding_config.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/protobuf.h"
@@ -221,6 +227,22 @@ class HloModuleConfig {
   }
   float memory_fitting_effort() const { return memory_fitting_effort_; }
 
+  void set_optimization_level(
+      ExecutionOptions::EffortLevel optimization_level) {
+    optimization_level_ = optimization_level;
+  }
+  ExecutionOptions::EffortLevel optimization_level() const {
+    return optimization_level_;
+  }
+
+  void set_memory_fitting_level(
+      ExecutionOptions::EffortLevel memory_fitting_level) {
+    memory_fitting_level_ = memory_fitting_level;
+  }
+  ExecutionOptions::EffortLevel memory_fitting_level() const {
+    return memory_fitting_level_;
+  }
+
   // If enabled, deduplicate equivalent hlos into function calls to reduce code
   // size.
   void set_deduplicate_hlo(bool deduplicate_hlo) {
@@ -264,6 +286,9 @@ class HloModuleConfig {
   }
   void set_static_device_assignment(const DeviceAssignment& device_assignment) {
     static_device_assignment_ = device_assignment;
+  }
+  void reset_static_device_assignment() {
+    static_device_assignment_ = std::nullopt;
   }
 
   // Checks if this config has a simulated device assignment.
@@ -325,8 +350,11 @@ class HloModuleConfig {
   const std::vector<std::vector<bool>>& fusion_config() const {
     return fusion_config_;
   }
-  std::vector<std::vector<bool>>* mutable_fusion_config() {
-    return &fusion_config_;
+  void set_fusion_config(std::vector<std::vector<bool>> fusion_config) {
+    fusion_config_ = std::move(fusion_config);
+  }
+  std::vector<std::vector<bool>>& mutable_fusion_config() {
+    return fusion_config_;
   }
 
   const absl::flat_hash_map<std::string, std::vector<int64_t>>& dot_config()
@@ -347,9 +375,16 @@ class HloModuleConfig {
   const std::vector<std::vector<bool>>& phase_ordering_config() const {
     return phase_ordering_config_;
   }
-  std::vector<std::vector<bool>>* mutable_phase_ordering_config() {
-    return &phase_ordering_config_;
+  void set_phase_ordering_config(
+      std::vector<std::vector<bool>> phase_ordering_config) {
+    phase_ordering_config_ = std::move(phase_ordering_config);
   }
+  std::vector<std::vector<bool>>& mutable_phase_ordering_config() {
+    return phase_ordering_config_;
+  }
+
+  const ShardingConfig& sharding_config() const { return sharding_config_; }
+  ShardingConfig* mutable_sharding_config() { return &sharding_config_; }
 
   int phase_index() const { return phase_index_; }
   void set_phase_index(const int phase_index) { phase_index_ = phase_index; }
@@ -398,7 +433,9 @@ class HloModuleConfig {
   }
 
   absl::string_view fdo_profile() const { return fdo_profile_; }
-  std::string* mutable_fdo_profile() { return &fdo_profile_; }
+  void set_fdo_profile(absl::string_view fdo_profile) {
+    fdo_profile_ = fdo_profile;
+  }
 
   int64_t device_memory_size() const { return device_memory_size_; }
   void set_device_memory_size(int64_t device_memory_size) {
@@ -460,6 +497,23 @@ class HloModuleConfig {
   // instead. Positive values, on the other hand, might enable costly algorithms
   // to reduce memory usage that are off by default.
   float memory_fitting_effort_ = 0.0f;
+
+  // The amount of effort to spend on optimizing for minimizing program
+  // execution time. As a general guideline, O2 strongly prioritizes execution
+  // time, and is typically suitable for production workloads. O3 may enable
+  // costly or experimental optimizations that may greatly increase compile
+  // time.
+  ExecutionOptions::EffortLevel optimization_level_ =
+      ExecutionOptions::EFFORT_UNKNOWN;
+
+  // The amount of effort to spend on making the program fit in memory (where
+  // "fit in memory" here has a backend-dependent meaning). As a general
+  // guideline, O2 will expend significant effort on attempting to make the
+  // program fit. O0 will spend minimal effort and fail as quickly as possible
+  // instead. O3 might enable costly algorithms to reduce memory usage that may
+  // greatly increase compile time.
+  ExecutionOptions::EffortLevel memory_fitting_level_ =
+      ExecutionOptions::EFFORT_UNKNOWN;
 
   // If enabled, deduplicate equivalent hlos into function calls to reduce code
   // size.
@@ -559,6 +613,11 @@ class HloModuleConfig {
   int64_t device_memory_size_ = 0;
 
   bool use_shardy_partitioner_ = false;
+
+  // Sharding configuration, where sharding_config_.nodes[v] controls the
+  // sharding of operation v.
+  ShardingConfig sharding_config_;
+
   // LINT.ThenChange(//tensorflow/compiler/xla/xla.proto)
 };
 

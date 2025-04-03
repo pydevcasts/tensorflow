@@ -18,20 +18,22 @@ limitations under the License.
 #include <cstddef>
 #include <memory>
 #include <string>
-#include <string_view>
 
+#include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+#include "xla/hlo/testlib/test.h"
 #include "xla/literal_util.h"
 #include "xla/service/computation_placer.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/test.h"
-#include "tsl/platform/status.h"
-#include "tsl/platform/test_benchmark.h"
+#include "xla/tsl/platform/status.h"
+#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/platform/test_benchmark.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 
@@ -117,19 +119,48 @@ TEST_F(HloDfsReachabilityTest, NonTrivialReachability) {
   EXPECT_FALSE(reachability->IsConnected(add, negate));
 }
 
+TEST_F(HloDfsReachabilityTest, ReplaceInstructionAfterFusion) {
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
+  HloModule m
+
+  ENTRY main {
+    param = f32[10]{0} parameter(0)
+    abs = f32[10]{0} abs(param)
+    ROOT negate = f32[10]{0} negate(abs)
+  })"));
+  auto computation = module->entry_computation();
+  auto reachability = HloDfsReachability::Build(computation);
+  auto neg = computation->root_instruction();
+  auto abs = neg->mutable_operand(0);
+  auto p0 = abs->operand(0);
+  EXPECT_TRUE(reachability->IsPresent(neg));
+  EXPECT_TRUE(reachability->IsPresent(abs));
+  EXPECT_TRUE(reachability->IsPresent(p0));
+  EXPECT_TRUE(reachability->IsReachable(p0, neg));
+  auto fusion = computation->AddInstruction(HloInstruction::CreateFusion(
+      neg->shape(), HloInstruction::FusionKind::kLoop, neg));
+  fusion->FuseInstruction(abs);
+  reachability->OnInstructionReplaced(neg, fusion);
+  EXPECT_FALSE(reachability->IsPresent(neg));
+  EXPECT_TRUE(reachability->IsPresent(fusion));
+  EXPECT_TRUE(reachability->IsReachable(p0, fusion));
+}
+
 TEST_F(HloDfsReachabilityTest, ChannelReachability) {
   const Shape shape = ShapeUtil::MakeShape(F32, {5, 7});
   HloComputation::Builder builder("ChannelReachability");
   auto param = builder.AddInstruction(
       HloInstruction::CreateParameter(0, shape, "param"));
   auto token0 = builder.AddInstruction(HloInstruction::CreateToken());
-  auto send =
-      builder.AddInstruction(HloInstruction::CreateSend(param, token0, 1));
-  auto send_done = builder.AddInstruction(HloInstruction::CreateSendDone(send));
+  auto send = builder.AddInstruction(HloInstruction::CreateSend(
+      param, token0, /*channel_id=*/1, /*is_host_transfer=*/false));
+  auto send_done = builder.AddInstruction(HloInstruction::CreateSendDone(
+      send, send->channel_id(), /*is_host_transfer=*/false));
   auto token1 = builder.AddInstruction(HloInstruction::CreateToken());
-  auto recv =
-      builder.AddInstruction(HloInstruction::CreateRecv(shape, token1, 1));
-  auto recv_done = builder.AddInstruction(HloInstruction::CreateRecvDone(recv));
+  auto recv = builder.AddInstruction(HloInstruction::CreateRecv(
+      shape, token1, /*channel_id=*/1, /*is_host_transfer=*/false));
+  auto recv_done = builder.AddInstruction(HloInstruction::CreateRecvDone(
+      recv, recv->channel_id(), /*is_host_transfer=*/false));
 
   auto module = CreateNewVerifiedModule();
   module->mutable_config().set_use_spmd_partitioning(false);
@@ -143,7 +174,7 @@ TEST_F(HloDfsReachabilityTest, ChannelReachability) {
 
 class HloDfsReachabilityBenchmark {
  public:
-  HloDfsReachabilityBenchmark(int size, std::string_view name) : name_(name) {
+  HloDfsReachabilityBenchmark(int size, absl::string_view name) : name_(name) {
     Shape r0f32 = ShapeUtil::MakeShape(F32, {});
     auto builder = HloComputation::Builder(name);
 

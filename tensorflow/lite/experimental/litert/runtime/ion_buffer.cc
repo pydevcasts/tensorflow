@@ -14,9 +14,6 @@
 
 #include "tensorflow/lite/experimental/litert/runtime/ion_buffer.h"
 
-#include <dlfcn.h>
-#include <sys/mman.h>
-
 #include <cstddef>
 #include <memory>
 #include <utility>
@@ -24,13 +21,19 @@
 #include "absl/base/attributes.h"
 #include "absl/base/const_init.h"
 #include "absl/container/node_hash_map.h"
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "tensorflow/lite/experimental/litert/c/litert_common.h"
+#include "tensorflow/lite/experimental/litert/cc/litert_expected.h"
+
+#if LITERT_HAS_ION_SUPPORT
+#include <dlfcn.h>
+#include <sys/mman.h>
+#endif  // LITERT_HAS_ION_SUPPORT
 
 namespace litert {
 namespace internal {
 
+#if LITERT_HAS_ION_SUPPORT
 namespace {
 
 class IonLibrary {
@@ -43,51 +46,57 @@ class IonLibrary {
     }
   }
 
-  static absl::StatusOr<Ptr> Create() {
+  static Expected<Ptr> Create() {
     DlHandle dlhandle(::dlopen("libion.so", RTLD_NOW | RTLD_LOCAL), ::dlclose);
     if (!dlhandle) {
-      return absl::InternalError("libion.so not found");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "libion.so not found");
     }
 
     auto ion_open =
         reinterpret_cast<IonOpen>(::dlsym(dlhandle.get(), "ion_open"));
     if (!ion_open) {
-      return absl::InternalError("ion_open not found");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure, "ion_open not found");
     }
 
     auto ion_close =
         reinterpret_cast<IonClose>(::dlsym(dlhandle.get(), "ion_close"));
     if (!ion_close) {
-      return absl::InternalError("ion_close not found");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "ion_close not found");
     }
 
     auto ion_alloc_fd =
         reinterpret_cast<IonAllocFd>(::dlsym(dlhandle.get(), "ion_alloc_fd"));
     if (!ion_alloc_fd) {
-      return absl::InternalError("ion_alloc_fd not found");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "ion_alloc_fd not found");
     }
 
     int client_fd = ion_open();
     if (client_fd < 0) {
-      return absl::InternalError("Failed to open ion device");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "Failed to open ion device");
     }
 
     return Ptr(new IonLibrary(std::move(dlhandle), client_fd, ion_close,
                               ion_alloc_fd));
   }
 
-  absl::StatusOr<IonBuffer> Alloc(size_t size, size_t alignment) {
+  Expected<IonBuffer> Alloc(size_t size, size_t alignment) {
     int heap_id_mask = 1 << kIonHeapId;
     int fd;
     if (auto status = ion_alloc_fd_(client_fd_, size, alignment, heap_id_mask,
                                     kIonFlags, &fd);
         status != 0) {
-      return absl::InternalError("Failed to allocate DMA-BUF buffer");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "Failed to allocate DMA-BUF buffer");
     }
     void* addr =
         ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (addr == MAP_FAILED) {
-      return absl::InternalError("Failed to mem-map DMA-BUF buffer");
+      return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                        "Failed to mem-map DMA-BUF buffer");
     }
     records_[addr] = Record{.fd = fd, .addr = addr, .size = size};
     return IonBuffer{.fd = fd, .addr = addr};
@@ -137,38 +146,50 @@ class IonLibrary {
 IonLibrary* TheIonLibrary;
 ABSL_CONST_INIT absl::Mutex TheMutex(absl::kConstInit);
 
-absl::Status InitLibraryIfNeededUnlocked() {
+Expected<void> InitLibraryIfNeededUnlocked() {
   if (!TheIonLibrary) {
-    if (auto library = IonLibrary::Create(); library.ok()) {
+    if (auto library = IonLibrary::Create(); library) {
       TheIonLibrary = library->release();
     } else {
-      return library.status();
+      return Unexpected(library.Error());
     }
   }
   return {};
 }
 
 }  // namespace
+#endif  // LITERT_HAS_ION_SUPPORT
 
 bool IonBuffer::IsSupported() {
+#if LITERT_HAS_ION_SUPPORT
   absl::MutexLock lock(&TheMutex);
   auto status = InitLibraryIfNeededUnlocked();
-  return status.ok();
+  return static_cast<bool>(status);
+#else   // LITERT_HAS_ION_SUPPORT
+  return false;
+#endif  // LITERT_HAS_ION_SUPPORT
 }
 
-absl::StatusOr<IonBuffer> IonBuffer::Alloc(size_t size, size_t alignment) {
+Expected<IonBuffer> IonBuffer::Alloc(size_t size, size_t alignment) {
+#if LITERT_HAS_ION_SUPPORT
   absl::MutexLock lock(&TheMutex);
-  if (auto status = InitLibraryIfNeededUnlocked(); !status.ok()) {
-    return status;
+  if (auto status = InitLibraryIfNeededUnlocked(); !status) {
+    return status.Error();
   }
   return TheIonLibrary->Alloc(size, alignment);
+#else   // LITERT_HAS_ION_SUPPORT
+  return Unexpected(kLiteRtStatusErrorUnsupported,
+                    "IonBuffer::Alloc not implemented for this platform");
+#endif  // LITERT_HAS_ION_SUPPORT
 }
 
 void IonBuffer::Free(void* addr) {
+#if LITERT_HAS_ION_SUPPORT
   absl::MutexLock lock(&TheMutex);
   if (TheIonLibrary) {
     TheIonLibrary->Free(addr);
   }
+#endif  // LITERT_HAS_ION_SUPPORT
 }
 
 }  // namespace internal

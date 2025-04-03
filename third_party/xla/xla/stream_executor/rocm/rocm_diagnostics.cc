@@ -34,8 +34,8 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/strip.h"
+#include "xla/tsl/platform/logging.h"
 #include "tsl/platform/host_info.h"
-#include "tsl/platform/logging.h"
 
 namespace stream_executor {
 namespace rocm {
@@ -204,7 +204,7 @@ absl::StatusOr<DriverVersion> Diagnostician::FindKernelModuleVersion(
 
   std::string version_and_rest = driver_version_file_contents.substr(
       offset + strlen(kDriverFilePrelude), std::string::npos);
-  size_t space_index = version_and_rest.find(" ");
+  size_t space_index = version_and_rest.find(' ');
   auto kernel_version = version_and_rest.substr(0, space_index);
   // TODO(b/22689637): Eliminate the explicit namespace if possible.
   auto stripped_kernel_version = absl::StripSuffix(kernel_version, ".ld64");

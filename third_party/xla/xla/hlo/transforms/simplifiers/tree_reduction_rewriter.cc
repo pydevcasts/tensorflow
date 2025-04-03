@@ -16,13 +16,17 @@ limitations under the License.
 #include "xla/hlo/transforms/simplifiers/tree_reduction_rewriter.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "xla/hlo/builder/padding.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -67,7 +71,8 @@ class ReductionRewriterVisitor : public DfsHloRewriteVisitor {
 
     std::vector<int64_t> window_dimensions;
     std::vector<int64_t> window_strides;
-    for (int64_t dim_idx = 0; dim_idx < input_shape.rank(); dim_idx++) {
+    for (int64_t dim_idx = 0; dim_idx < input_shape.dimensions_size();
+         dim_idx++) {
       if (!absl::c_linear_search(hlo->dimensions(), dim_idx)) {
         window_dimensions.push_back(1);
         window_strides.push_back(1);

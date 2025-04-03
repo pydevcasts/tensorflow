@@ -26,9 +26,9 @@ limitations under the License.
 #include "tensorflow/core/platform/test_benchmark.h"
 #include "tensorflow/core/profiler/lib/profiler_session.h"
 #include "tensorflow/core/profiler/protobuf/memory_profile.pb.h"
-#include "tensorflow/core/profiler/protobuf/xplane.pb.h"
 #include "tensorflow/core/profiler/utils/xplane_schema.h"
 #include "tensorflow/core/profiler/utils/xplane_visitor.h"
+#include "tsl/profiler/protobuf/xplane.pb.h"
 
 namespace tensorflow {
 
@@ -226,9 +226,8 @@ TEST(CPUAllocatorTest, ProfilerReporting) {
   void* p1 = a->AllocateRaw(1, 16);
 
   // Start profiling
-  std::unique_ptr<ProfilerSession> profiler =
-      tensorflow::ProfilerSession::Create(
-          tensorflow::ProfilerSession::DefaultOptions());
+  std::unique_ptr<tsl::ProfilerSession> profiler =
+      tsl::ProfilerSession::Create(tsl::ProfilerSession::DefaultOptions());
 
   // Profiled allocations
   void* p2 = a->AllocateRaw(1, 32);

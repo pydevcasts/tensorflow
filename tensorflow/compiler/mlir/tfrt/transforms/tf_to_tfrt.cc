@@ -18,6 +18,12 @@ limitations under the License.
 // should not depend on the code here. And please do not take example on it as
 // "the path forward" for this.
 
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -1880,8 +1886,8 @@ static void CreateTfExecutorToTfrtPipelineHelper(
 // If verbose logging is on, dump the output of each pass to a file directory,
 // set via env var TF_DUMP_GRAPH_PREFIX. e.g.:
 // export TF_DUMP_GRAPH_PREFIX=/tmp/mlir
-Status CreateTfExecutorToTfrtPipeline(mlir::PassManager &pm,
-                                      const TfrtPipelineOptions &options) {
+absl::Status CreateTfExecutorToTfrtPipeline(
+    mlir::PassManager &pm, const TfrtPipelineOptions &options) {
   TF_RETURN_IF_ERROR(
       CreateTFExecutorToTFPreInvariantOptimizationPipeline(pm, options));
   CreateTFExecutorToTFInvariantOptimizationPipelineHelper(pm, options);
@@ -1889,8 +1895,8 @@ Status CreateTfExecutorToTfrtPipeline(mlir::PassManager &pm,
   return absl::OkStatus();
 }
 
-Status CreateTFExecutorToTFPipeline(mlir::PassManager &pm,
-                                    const TfrtPipelineOptions &options) {
+absl::Status CreateTFExecutorToTFPipeline(mlir::PassManager &pm,
+                                          const TfrtPipelineOptions &options) {
   TF_RETURN_IF_ERROR(
       CreateTFExecutorToTFPreInvariantOptimizationPipeline(pm, options));
   CreateTFExecutorToTFInvariantOptimizationPipelineHelper(pm, options);

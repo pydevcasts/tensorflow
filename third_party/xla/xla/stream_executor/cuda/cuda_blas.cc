@@ -22,7 +22,11 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/base/casts.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
@@ -40,32 +44,28 @@ limitations under the License.
 #include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/cuda/cuda_blas_utils.h"
+#include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/cuda/cuda_helpers.h"
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
-#include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/gpu/gpu_helpers.h"
-#include "xla/stream_executor/gpu/gpu_stream.h"
-#include "xla/stream_executor/gpu/gpu_types.h"
 #include "xla/stream_executor/numeric_options.h"
 #include "xla/stream_executor/platform/initialize.h"
 #include "xla/stream_executor/plugin_registry.h"
 #include "xla/stream_executor/scratch_allocator.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/logging.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/protobuf/dnn.pb.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/logging.h"
-#include "tsl/platform/statusor.h"
 #include "tsl/platform/tensor_float_32_utils.h"
 
 namespace stream_executor {
 namespace cuda {
 
-using gpu::AsGpuStreamValue;
 using gpu::GpuMemory;
 using gpu::GpuMemoryMutable;
-using gpu::GpuStreamHandle;
 
 // cuBLAS has interfaces that permit pointers to be passed from either the host
 // memory space or the device memory space; however, you must instruct it as to
@@ -232,7 +232,10 @@ bool CUDABlas::SetStream(Stream *stream) {
   CHECK(blas_ != nullptr);
   std::unique_ptr<ActivateContext> activation = parent_->Activate();
 
-  auto handle = (stream != nullptr) ? AsGpuStreamValue(stream) : nullptr;
+  auto handle =
+      (stream != nullptr)
+          ? absl::bit_cast<CUstream>(stream->platform_specific_handle().stream)
+          : nullptr;
   if (auto ret = cublasSetStream(blas_, handle); ret != CUBLAS_STATUS_SUCCESS) {
     LOG(ERROR) << "failed to set stream for cuBLAS calls: " << ToString(ret);
     return false;
@@ -243,7 +246,7 @@ bool CUDABlas::SetStream(Stream *stream) {
 absl::StatusOr<bool> CUDABlas::IsMainStreamSet() const {
   absl::MutexLock lock{&mu_};
   CHECK(blas_ != nullptr);
-  GpuStreamHandle handle{};
+  CUstream handle{};
   if (auto ret = cublasGetStream(blas_, &handle);
       ret != CUBLAS_STATUS_SUCCESS) {
     return absl::InternalError("failed to get the current stream value");
@@ -827,7 +830,7 @@ bool CUDABlas::GetBlasGemmAlgorithms(
   // still return the out_algorithms. Caller needs to make sure that in this
   // case, the returned vector is empty.
   if (stream->GetCudaComputeCapability().IsAtLeast(
-          CudaComputeCapability::AMPERE)) {
+          CudaComputeCapability::kAmpere)) {
     // Note: for NVIDIA Ampere Architecture GPUs and beyond, i.e. SM version >=
     // 80, the numbered algorithm options are equivalent to CUBLAS_GEMM_DEFAULT
     // or CUBLAS_GEMM_DEFAULT_TENSOR_OP respectively.
@@ -1407,7 +1410,7 @@ void initialize_cublas() {
           });
 
   if (!status.ok()) {
-    LOG(ERROR) << "Unable to register cuBLAS factory: " << status.message();
+    LOG(INFO) << "Unable to register cuBLAS factory: " << status.message();
   }
 }
 

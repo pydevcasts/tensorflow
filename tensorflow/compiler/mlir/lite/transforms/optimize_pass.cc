@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -40,6 +41,7 @@ limitations under the License.
 #include "llvm/Support/Casting.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"  // from @llvm-project
 #include "mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
+#include "mlir/Dialect/Quant/IR/QuantTypes.h"  // from @llvm-project
 #include "mlir/IR/Attributes.h"  // from @llvm-project
 #include "mlir/IR/Builders.h"  // from @llvm-project
 #include "mlir/IR/BuiltinAttributeInterfaces.h"  // from @llvm-project
@@ -290,17 +292,6 @@ bool IsBroadcastableElementsAttrAndType(Type a, Type b) {
   return OpTrait::util::getBroadcastedType(a, b) != Type();
 }
 
-// Returns whether the resultant type of any broadcastable operation with
-// operands `a` and `b` matches `expected_output`. Returns false if `a` is not
-// broadcast-compatible with `b`.
-bool OperandsBroadcastToOutputType(Type a, Type b, Type expected_output) {
-  Type output_element_type =
-      mlir::cast<ShapedType>(expected_output).getElementType();
-  Type broadcasted_type =
-      OpTrait::util::getBroadcastedType(a, b, output_element_type);
-  return broadcasted_type != Type() && broadcasted_type == expected_output;
-}
-
 // Returns whether if `type1` dimensions are the same as the ending dimensions
 // of `type2`. This is more restricted than broadcastable.
 bool IsTailOfShape(Type type1, Type type2) {
@@ -490,32 +481,41 @@ Value GetBiasMultiplier(OpBuilder &builder, Value binary_op,
   return builder.create<arith::ConstantOp>(binary_op.getLoc(), constant_attr);
 }
 
-// Expand Attribute 'a' to 4D with all 1s except 1 dimension.
-// Which dimension depends on 'is_depthwise' is true or false.
-ElementsAttr ExpandTo4DForConvImpl(Attribute a, bool is_depthwise) {
-  auto elements = mlir::dyn_cast<DenseElementsAttr>(a);
-  auto shape = elements.getType().getShape();
-  if (!shape.empty()) {
-    // Checks that elements are essentially 1d.
-    assert(elements.getNumElements() == shape.back());
+bool HasOneTailUnitDimension(Attribute attr) {
+  auto elements = mlir::dyn_cast<DenseElementsAttr>(attr);
+  if (!elements) {
+    return false;
   }
+  auto shape = elements.getType().getShape();
+  if (shape.empty()) {
+    return true;
+  }
+  // Checks that elements are essentially 1d.
+  return elements.getNumElements() == shape.back();
+}
+
+// Expand a given attribute to 4D with all 1s except 1 dimension.
+// The position of the non-1 dimension is specified by `output_channel_dim`.
+// Example: [1, 1, 5], 2 -> [1, 1, 5, 1]
+DenseElementsAttr ExpandTo4DForConvImpl(Attribute attr,
+                                        int output_channel_dim) {
+  assert(HasOneTailUnitDimension(attr));
+  auto elements = mlir::dyn_cast<DenseElementsAttr>(attr);
   std::vector<int64_t> shape_data = {1, 1, 1, 1};
   const int vector_length = elements.getNumElements();
-  if (is_depthwise)
-    shape_data[3] = vector_length;
-  else
-    shape_data[0] = vector_length;
+  shape_data[output_channel_dim] = vector_length;
   auto new_shape =
       RankedTensorType::get(shape_data, elements.getType().getElementType());
   return elements.reshape(new_shape);
 }
 
-ElementsAttr ExpandTo4DForConv(Attribute a) {
-  return ExpandTo4DForConvImpl(a, false);
+DenseElementsAttr ExpandTo4DForConv(Attribute attr,
+                                    int output_channel_dim = 0) {
+  return ExpandTo4DForConvImpl(attr, output_channel_dim);
 }
 
-ElementsAttr ExpandTo4DForDepthwiseConv(Attribute a) {
-  return ExpandTo4DForConvImpl(a, true);
+DenseElementsAttr ExpandTo4DForDepthwiseConv(Attribute a) {
+  return ExpandTo4DForConvImpl(a, 3);
 }
 
 TypeAttr RescaleQtype(Type input, Attribute factor) {
@@ -823,21 +823,6 @@ bool IsPermutationNCHW(Value perm) {
 }
 
 #include "tensorflow/compiler/mlir/lite/transforms/generated_optimize.inc"
-
-// Returns 1D 32-bit dense elements attribute with the given values.
-static DenseIntElementsAttr GetI32ElementsAttr(ArrayRef<int32_t> values,
-                                               Builder *builder) {
-  RankedTensorType ty = mlir::RankedTensorType::get(
-      {static_cast<int32_t>(values.size())}, builder->getIntegerType(32));
-  return DenseIntElementsAttr::get(ty, values);
-}
-
-DenseIntElementsAttr GetI64ElementsAttr(ArrayRef<int64_t> values,
-                                        Builder *builder) {
-  RankedTensorType ty = RankedTensorType::get(
-      {static_cast<int64_t>(values.size())}, builder->getIntegerType(64));
-  return DenseIntElementsAttr::get(ty, values);
-}
 
 // Get the number of leading 1s in the shape of the given input.
 // Ex. input_shape = [1 x 1 x 1 x 1 x 2 x 1] => 4
@@ -1676,76 +1661,138 @@ struct FuseAffinOpAndMulWithQDQs : public OpRewritePattern<TFL::MulOp> {
 
   LogicalResult matchAndRewrite(TFL::MulOp mul_op,
                                 PatternRewriter &rewriter) const override {
-    // Mul. Required 1-D rhs for batch normalization.
+    // Mul. Required 1-D or squeezable to 1-D rhs for batch normalization.
     DenseElementsAttr gamma_cst;
     Value gamma = mul_op.getRhs();
     if (!matchPattern(gamma, m_Constant(&gamma_cst))) return failure();
-    if (gamma_cst.getType().getRank() != 1) return failure();
+    if (!HasOneTailUnitDimension(gamma_cst)) {
+      return failure();
+    }
 
     // Affine op
     Operation *mul_op_lhs = mul_op.getLhs().getDefiningOp();
-    auto fc_op = dyn_cast_or_null<AffineOpType>(mul_op_lhs);
-    if (!fc_op) return failure();
-    Value filter = fc_op.getFilter();
-    Value bias = fc_op.getBias();
-
-    // QDQs
-    auto dq_op = dyn_cast_or_null<TFL::DequantizeOp>(filter.getDefiningOp());
-    if (!dq_op) return failure();
-    auto q_op =
-        dyn_cast_or_null<TFL::QuantizeOp>(dq_op.getInput().getDefiningOp());
-    if (!q_op) return failure();
-    filter = q_op.getInput();
-
-    // weight constant
-    ElementsAttr cst_tmp;
-    if (!matchPattern(filter, m_Constant(&cst_tmp))) return failure();
-    if (!mlir::isa<NoneType>(bias.getType()) &&
-        !matchPattern(bias, m_Constant(&cst_tmp)))
+    auto affine_op = dyn_cast_or_null<AffineOpType>(mul_op_lhs);
+    if (!affine_op) {
       return failure();
-    if (fc_op.getFusedActivationFunction() != "NONE") return failure();
+    }
+    // This is the tensor feeding the affine op's rhs. This is not necessarily
+    // the filter since it could be produced by a transpose or a Q-DQ).
+    Value affine_rhs = affine_op.getFilter();
+    Value bias = affine_op.getBias();
 
-    // Broadcast the constant operand of Mul if it isn't compatible to the
-    // filter input. We only support broadcasting the operand along the depth
-    // dimension, when the operand's depth is 1.
-    rewriter.setInsertionPoint(q_op);
-    Location loc = fc_op.getLoc();
-    Value broadcasted_gamma;
-    if (isa<TFL::Conv2DOp>(mul_op_lhs)) {
-      auto mul_rhs = ExpandTo4DForConv(gamma_cst);
-      broadcasted_gamma = rewriter.create<ConstOp>(loc, mul_rhs);
-    } else if (isa<TFL::DepthwiseConv2DOp>(mul_op_lhs)) {
-      auto mul_rhs = ExpandTo4DForDepthwiseConv(gamma_cst);
-      broadcasted_gamma = rewriter.create<ConstOp>(loc, mul_rhs);
+    // This indicates which dimension of the actual filter constant contains
+    // the output channels dimension.
+    int filter_output_dim = -1;
+    if (isa<TFL::Conv2DOp>(affine_op)) {
+      filter_output_dim = 0;
+    } else if (isa<TFL::DepthwiseConv2DOp>(affine_op)) {
+      filter_output_dim = 3;
     } else {
       return failure();
     }
-
-    // Make sure that the fused bias will be a 1D tensor.
-    auto gamma_shape = mlir::cast<ShapedType>(gamma.getType());
-    if (!gamma_shape.hasRank() || gamma_shape.getRank() != 1) {
-      return failure();
+    // The rhs could be :
+    // const -> QDQ -> [transpose | reshape] -> conv
+    auto reshape_op =
+        dyn_cast_or_null<TFL::ReshapeOp>(affine_rhs.getDefiningOp());
+    // If the filter is created by a transpose op, check if the there is QDQ
+    // feeding that transpose.
+    if (auto transpose_op =
+            dyn_cast_or_null<TFL::TransposeOp>(affine_rhs.getDefiningOp())) {
+      // If there is a transpose op, reassigning affine_rhs to be the
+      // pre-transpose tensor.
+      affine_rhs = transpose_op.getInput();
+      DenseIntElementsAttr permutation_cst;
+      if (!matchPattern(transpose_op.getPerm(), m_Constant(&permutation_cst))) {
+        return failure();
+      }
+      SmallVector<int32_t> permutation_vec =
+          llvm::to_vector(permutation_cst.getValues<int32_t>());
+      // reversing the effect of the transpose op. For example, if the output
+      // dimension is 0, after transpose with a transpose permutation vector of
+      // [3, 0, 1, 2], the pre-transpose output dimension (or the actual filter
+      // output dimension) would be 3.
+      filter_output_dim = permutation_vec[filter_output_dim];
+    } else if (reshape_op) {
+      affine_rhs = reshape_op.getInput();
     }
 
-    // Rewrite filter constant. Since the folder of TFL::MulOp couldn't
-    // broadcast the operands, TF::MulOp is used to fold the constant.
-    auto new_filter =
-        rewriter.create<TF::MulOp>(loc, filter, broadcasted_gamma).getZ();
+    // QDQs
+    auto dq_op =
+        dyn_cast_or_null<TFL::DequantizeOp>(affine_rhs.getDefiningOp());
+    if (!dq_op) {
+      return failure();
+    }
+    auto q_op =
+        dyn_cast_or_null<TFL::QuantizeOp>(dq_op.getInput().getDefiningOp());
+    if (!q_op) {
+      return failure();
+    }
+    // If the transpose is changed to a reshape op, we'll resort to finding the
+    // output channel from the quant_dimension of the Q op if it is per-channel.
+    if (reshape_op) {
+      auto per_axis_quantized_type =
+          dyn_cast<quant::UniformQuantizedPerAxisType>(
+              getElementTypeOrSelf(q_op.getType()));
+      if (per_axis_quantized_type) {
+        filter_output_dim = per_axis_quantized_type.getQuantizedDimension();
+      } else {
+        // If transpose op is replaced with a reshape op, we've already lost the
+        // permutation. If the Q op is not per-channel, we're out of luck to
+        // find the channel dimension of the filter.
+        return failure();
+      }
+    }
+    Value filter = q_op.getInput();
+
+    // weight constant
+    ElementsAttr cst_tmp;
+    if (!matchPattern(filter, m_Constant(&cst_tmp))) {
+      return failure();
+    }
+    if (!mlir::isa<NoneType>(bias.getType()) &&
+        !matchPattern(bias, m_Constant(&cst_tmp))) {
+      return failure();
+    }
+    if (affine_op.getFusedActivationFunction() != "NONE") {
+      return failure();
+    }
+    rewriter.setInsertionPoint(q_op);
+    Location loc = affine_op.getLoc();
+
+    DenseElementsAttr broadcasted_gamma_attr =
+        ExpandTo4DForConv(gamma_cst, filter_output_dim);
+    auto broadcasted_gamma =
+        rewriter.create<ConstOp>(loc, broadcasted_gamma_attr);
+
+    // Inject a mul between the filter constant and the quantize op.
+    auto new_filter = rewriter
+                          .create<TFL::MulOp>(loc, filter, broadcasted_gamma,
+                                              rewriter.getStringAttr("NONE"))
+                          .getResult();
     // Update the scale in the quantize op.
     auto new_qtype = RescaleQtype(q_op.getQtype(), gamma_cst);
-    if (!new_qtype) return failure();
+    if (!new_qtype) {
+      return failure();
+    }
+    // Update the Q op to a new Q op with the new multiplied scale.
     rewriter.replaceOpWithNewOp<TFL::QuantizeOp>(q_op, new_qtype.getValue(),
                                                  new_filter, new_qtype);
-
     // If bias isn't None, it needs to be multiplied as well.
     if (!mlir::isa<NoneType>(bias.getType())) {
-      rewriter.setInsertionPoint(fc_op);
-      auto new_bias = rewriter.create<TF::MulOp>(loc, bias, gamma);
-      fc_op.getOperation()->replaceUsesOfWith(bias, new_bias);
+      rewriter.setInsertionPoint(affine_op);
+
+      auto squeezed_gamma = FlattenTo1D(gamma_cst);
+      auto squeezed_gamma_type = squeezed_gamma.getType();
+      auto squeezed_gamma_op = rewriter.create<arith::ConstantOp>(
+          affine_op.getLoc(), squeezed_gamma_type, squeezed_gamma);
+
+      auto new_bias = rewriter.create<TFL::MulOp>(
+          loc, bias, squeezed_gamma_op, rewriter.getStringAttr("NONE"));
+      affine_op.getOperation()->replaceUsesOfWith(bias, new_bias);
     }
 
     // Remove the tailing mul op.
-    mul_op.replaceAllUsesWith(fc_op.getResult());
+    mul_op.replaceAllUsesWith(affine_op.getResult());
     return success();
   }
 };
@@ -1895,145 +1942,6 @@ struct FuseBinaryOpToFollowingAffineOp : public OpRewritePattern<AffineOpType> {
     return {*channel_index_iter, slice_size};
   }
 };
-
-// If the operand to a broadcastable op is a splat constant, try to replace it
-// with a 0-d constant, e.g. before this optimization,
-//   %cst = arith.constant dense<1.0> : tensor<16x16x4xf32>
-//   %0 = "tfl.conv_2d"...
-//   %1 = "tfl.add"(%0, %cst) : (tensor<16x16x4xf32>, tensor<16x16x4xf32>)
-// After this optimization:
-//   %cst = arith.constant dense<1.0> : tensor<f32>
-//   %0 = "tfl.conv_2d"...
-//   %1 = "tfl.add"(%0, %cst) : (tensor<16x16x4xf32>, tensor<f32>)
-// This pattern can enable more fusing opportunities when the binary op is
-// following conv ops.
-template <typename BinaryOpType>
-struct ScalarizeSplatConstantForBroadcastableOps
-    : public OpRewritePattern<BinaryOpType> {
-  using OpRewritePattern<BinaryOpType>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(BinaryOpType binary_op,
-                                PatternRewriter &rewriter) const override {
-    DenseElementsAttr splat_elements_attr;
-    if (!IsScalarizableSplatConstant(binary_op.getRhs(),
-                                     &splat_elements_attr)) {
-      return failure();
-    }
-
-    constexpr int kSplatOperandIndex = 1;
-    auto result_type = mlir::cast<ShapedType>(binary_op.getResult().getType());
-    mlir::Value non_splat_operand =
-        binary_op.getOperand(1 - kSplatOperandIndex);
-    auto non_splat_operand_type =
-        mlir::cast<ShapedType>(non_splat_operand.getType());
-    // If the other operand's shape does not equal to the result shape, then we
-    // cannot scalarize the splat constant because the result shape relies on
-    // the splat constant op's shape for broadcasting.
-    if (!non_splat_operand_type.hasStaticShape() ||
-        non_splat_operand_type.getShape() != result_type.getShape() ||
-        non_splat_operand_type.getRank() > 4) {
-      return failure();
-    }
-
-    // If non-splat operand is not fusable affine ops, then no need to apply
-    // this transformation.
-    if (!CanFuseAffineOp(non_splat_operand.getDefiningOp(), binary_op)) {
-      return failure();
-    }
-
-    // Creates a new scalar constant op using the splat value.
-    mlir::Value splat_operand = binary_op.getOperand(kSplatOperandIndex);
-    auto scalar_elements_attr = DenseElementsAttr::get(
-        RankedTensorType::get({},
-                              splat_elements_attr.getType().getElementType()),
-        splat_elements_attr.getSplatValue<mlir::Attribute>());
-
-    auto scalar_constant_op = rewriter.create<arith::ConstantOp>(
-        splat_operand.getLoc(), scalar_elements_attr.getType(),
-        scalar_elements_attr);
-
-    binary_op.setOperand(kSplatOperandIndex, scalar_constant_op);
-    return success();
-  }
-
- private:
-  // Returns true if this value is a splat constant op which can be scalarized.
-  // Also returns the elements attr if this value is indeed a splat constant.
-  bool IsScalarizableSplatConstant(mlir::Value value,
-                                   DenseElementsAttr *elements_attr) const {
-    if (!matchPattern(value, m_Constant(elements_attr))) {
-      return false;
-    }
-    auto element_type =
-        mlir::cast<ShapedType>(value.getType()).getElementType();
-    // Ignore per-axis quantized constants because after converting to scalar,
-    // we will lose per-axis qantization parameter.
-    if (mlir::isa<quant::UniformQuantizedPerAxisType>(element_type)) {
-      return false;
-    }
-    if (IsScalar(value)) {
-      return false;
-    }
-    return elements_attr->isSplat();
-  }
-
-  // If this type is a scalar shaped type.
-  bool IsScalar(mlir::Value value) const {
-    auto type = mlir::dyn_cast<ShapedType>(value.getType());
-    if (!type) {
-      return false;
-    }
-    if (!type.hasStaticShape()) {
-      return false;
-    }
-    return type.getNumElements() == 1;
-  }
-
-  // Returns true if we can fuse an affine op with consuming binary op.
-  bool CanFuseAffineOp(Operation *affine_op, Operation *binary_op) const {
-    if (!isa_and_nonnull<TFL::Conv2DOp, TFL::DepthwiseConv2DOp,
-                         TFL::FullyConnectedOp>(affine_op)) {
-      return false;
-    }
-    DenseElementsAttr value;
-    // Check that bias are constants if not none.
-    Value bias = affine_op->getOperand(2);
-    if (!mlir::isa<NoneType>(bias.getType()) &&
-        !matchPattern(bias, m_Constant(&value))) {
-      return false;
-    }
-    // If the binary op is mul/div, also check that filter is constant.
-    if (isa<TFL::MulOp, TFL::DivOp>(binary_op) &&
-        !matchPattern(affine_op->getOperand(1), m_Constant(&value))) {
-      return false;
-    }
-
-    // We can only fuse F32/BF16.
-    auto is_fusable_type = [](Type t) {
-      Type element_type = t;
-      if (auto shaped_type = mlir::dyn_cast<ShapedType>(t)) {
-        element_type = shaped_type.getElementType();
-      }
-      return element_type.isBF16() || element_type.isF32();
-    };
-    for (Type t : binary_op->getOperandTypes()) {
-      if (!is_fusable_type(t)) {
-        return false;
-      }
-    }
-
-    return true;
-  }
-};
-
-using ScalarizeSplatConstantForSub =
-    ScalarizeSplatConstantForBroadcastableOps<TFL::SubOp>;
-using ScalarizeSplatConstantForAdd =
-    ScalarizeSplatConstantForBroadcastableOps<TFL::AddOp>;
-using ScalarizeSplatConstantForMul =
-    ScalarizeSplatConstantForBroadcastableOps<TFL::MulOp>;
-using ScalarizeSplatConstantForDiv =
-    ScalarizeSplatConstantForBroadcastableOps<TFL::DivOp>;
 
 // Remove Reshape before FullyConnected when `keep_num_dims=false` and Reshape
 // does not alter the last dimension as FullyConnected will collapse all other
@@ -2558,6 +2466,32 @@ struct FuseLogSoftmax : public OpRewritePattern<TFL::SubOp> {
   }
 };
 
+// This is maintained for backward compatibility but not included in the strict
+// QDQ mode.
+// Equivalent to:
+// def eliminate_dq_q_pairs : Pat<
+//   (TFL_QuantizeOp (TFL_DequantizeOp $in), $qt),
+//   (replaceWithValue $in),
+//   [(NotFromQuantOpOrSameQuantType $in, $qt)]>;
+struct EliminateQDQPairs : public OpRewritePattern<TFL::QuantizeOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(TFL::QuantizeOp q_op,
+                                PatternRewriter &rewriter) const override {
+    if (auto dq_op = dyn_cast_or_null<TFL::DequantizeOp>(
+            q_op.getInput().getDefiningOp())) {
+      if (tflite::NotFromQuantOpOrSameQuantType(dq_op.getInput(),
+                                                q_op.getQtypeAttr())) {
+        q_op.replaceAllUsesWith(dq_op.getInput());
+        return success();
+      }
+      return rewriter.notifyMatchFailure(q_op,
+                                         "preceding DequantizeOp has different "
+                                         "input than the quantize quant type.");
+    }
+    return rewriter.notifyMatchFailure(q_op, "not preceded by a DequantizeOp.");
+  }
+};
+
 // This is the UndoBroadcastFullyConnectedBiasAdd pattern in
 // optimize_patterns.td but accounting for QDQ preceding Add's RHS.
 // The following doesn't work in TableGen due to some issues reconstructing
@@ -2582,8 +2516,8 @@ struct FuseLogSoftmax : public OpRewritePattern<TFL::SubOp> {
 //    (HasRankAtLeast<2> $bias),
 //    (IsDefinedByFullyConnectedOp $lhs)]>;
 struct UndoBroadcastFullyConnectedBiasAddWithQDQs
-    : public OpRewritePattern<TFL::AddOp> {
-  using OpRewritePattern::OpRewritePattern;
+    : public OpRewritePattern<TFL::AddOp>::SplitMatchAndRewrite {
+  using SplitMatchAndRewrite::SplitMatchAndRewrite;
   LogicalResult match(TFL::AddOp add_op) const override {
     if (!add_op->hasOneUse()) {
       return failure();
@@ -2756,6 +2690,114 @@ struct EnableFullyConnectedKeepNumDimsBeforeReshape
   }
 };
 
+// This pattern push transposes through squeeze ops to facilitate further
+// transpose and reshape fusions. For example, some JAX model could have
+// subgraphs like Reshape-Transpose-Squeeze. With this pattern, the transpose
+// can be pushed through the squeeze op, and fused with a subsequent reshape or
+// removed entirely. The squeeze op could also be fused with the former reshape.
+//
+// The pattern is designed to have lower benefit/priority than others,
+// while the push may still happen if the transpose could be fused with
+// downstream optimization phases or passe..
+struct PushTransposeThroughSqueeze : public RewritePattern {
+  explicit PushTransposeThroughSqueeze(MLIRContext *context)
+      : RewritePattern(TFL::SqueezeOp::getOperationName(), /*benefit=*/0,
+                       context) {}
+
+  LogicalResult matchAndRewrite(mlir::Operation *op,
+                                PatternRewriter &rewriter) const override {
+    TFL::SqueezeOp squeeze = cast<TFL::SqueezeOp>(op);
+    auto transpose = llvm::dyn_cast_or_null<TFL::TransposeOp>(
+        squeeze.getInput().getDefiningOp());
+    if (!transpose) {
+      return failure();
+    }
+
+    int32_t input_rank = transpose.getType().getShape().size();
+
+    llvm::SmallVector<int32_t, 4> squeeze_dims;
+    if (squeeze->hasAttr("squeeze_dims")) {
+      for (const auto &squeeze_dim : squeeze.getSqueezeDimsAttr()) {
+        squeeze_dims.push_back(
+            mlir::dyn_cast<IntegerAttr>(squeeze_dim).getInt());
+      }
+    }
+    if (squeeze_dims.empty()) {
+      for (int dim = 0; dim < input_rank; ++dim) {
+        if (transpose.getType().getDimSize(dim) == 1) {
+          squeeze_dims.push_back(dim);
+        }
+      }
+    }
+
+    mlir::DenseIntElementsAttr perm_attr;
+    if (!matchPattern(transpose.getPerm(), m_Constant(&perm_attr))) {
+      return failure();
+    }
+    llvm::SmallVector<int32_t, 4> perm;
+    for (const auto &dim : perm_attr.getValues<APInt>()) {
+      perm.push_back(dim.getSExtValue());
+    }
+
+    // Map squeeze dimensions to their positions after transpose.
+    llvm::sort(squeeze_dims);
+    llvm::SmallVector<int32_t, 4> new_squeeze_dims;
+    for (int32_t dim : squeeze_dims) {
+      new_squeeze_dims.push_back(perm[dim]);
+    }
+    llvm::sort(new_squeeze_dims);
+
+    // Filter the original transpose permutation to keep only non-squeezed
+    // positions.
+    llvm::SmallVector<int32_t> filtered_perm_original_indices;
+    for (int i = 0; i < input_rank; ++i) {
+      if (!llvm::is_contained(squeeze_dims, i)) {
+        filtered_perm_original_indices.push_back(perm[i]);
+      }
+    }
+
+    // Map the remaining original dimension indices to new 0-based indices after
+    // squeeze.
+    llvm::SmallVector<int32_t> original_remaining_dims;
+    for (int i = 0; i < input_rank; ++i) {
+      if (!llvm::is_contained(new_squeeze_dims, i)) {
+        original_remaining_dims.push_back(i);
+      }
+    }
+
+    llvm::SmallVector<int32_t> original_to_new_index_map(input_rank, -1);
+    for (int i = 0; i < original_remaining_dims.size(); ++i) {
+      original_to_new_index_map[original_remaining_dims[i]] = i;
+    }
+
+    llvm::SmallVector<int32_t> new_perm;
+    for (const auto &original_dim : filtered_perm_original_indices) {
+      new_perm.push_back(original_to_new_index_map[original_dim]);
+    }
+
+    llvm::SmallVector<int64_t> new_squeeze_shape;
+    for (int i = 0; i < input_rank; ++i) {
+      if (!llvm::is_contained(new_squeeze_dims, i)) {
+        new_squeeze_shape.push_back(
+            transpose.getInput().getType().getDimSize(i));
+      }
+    }
+    auto new_squeeze = rewriter.create<TFL::SqueezeOp>(
+        squeeze->getLoc(),
+        mlir::RankedTensorType::get(new_squeeze_shape,
+                                    squeeze.getType().getElementType()),
+        transpose.getInput(), rewriter.getI32ArrayAttr(new_squeeze_dims));
+
+    auto new_transpose = rewriter.create<TFL::TransposeOp>(
+        squeeze->getLoc(), squeeze.getType(), new_squeeze,
+        rewriter.create<arith::ConstantOp>(
+            squeeze->getLoc(), GetI32ElementsAttr(new_perm, &rewriter)));
+
+    rewriter.replaceOp(squeeze, new_transpose);
+    return success();
+  }
+};
+
 // Adds canonicalization patterns to the list of patterns.
 void AddCanonicalizationPatterns(MLIRContext *context,
                                  RewritePatternSet *patterns) {
@@ -2774,12 +2816,13 @@ void OptimizePass::runOnOperation() {
   RewritePatternSet phase_0_patterns(&getContext());
   phase_0_patterns
       .add<SqueezeReshapesAroundBroadcastOp, RemoveReshapeAfterFullyConnected,
-           RemoveReshapeBeforeFullyConnected, ConvertTFLBroadcastToMulOp,
+           RemoveReshapeBeforeFullyConnected,
            FuseOutputReshape_BatchMatMulWithFlattenedContractingDims,
            FuseSqueezingLhsReshapeIntoFC_Output,
-           FuseReshapesAroundBatchMatMulLHS, FuseReshapesAroundBatchMatMulLHS1>(
-          ctx);
-  (void)applyPatternsAndFoldGreedily(func, std::move(phase_0_patterns));
+           FuseReshapesAroundBatchMatMulLHS, FuseReshapesAroundBatchMatMulLHS1,
+           FuseInputReshape_BatchMatMulWithFlattenedRhsDims,
+           PushTransposeThroughSqueeze>(ctx);
+  (void)applyPatternsGreedily(func, std::move(phase_0_patterns));
 
   // Potentially the binary ops might be fused together, like hard_swish, thus
   // we explore these potentially first and then fuse the binary ops with the
@@ -2794,17 +2837,16 @@ void OptimizePass::runOnOperation() {
   if (!GetOptions().disable_fuse_mul_and_fc) {
     patterns.add<FuseMulAndFullyConnected>(ctx);
   }
-  if (GetOptions().enable_canonicalization)
+  if (GetOptions().enable_canonicalization) {
     AddCanonicalizationPatterns(ctx, &patterns);
-  (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+  }
+  (void)applyPatternsGreedily(func, std::move(patterns));
 
   // Fuse the binary ops with the following ops.
   RewritePatternSet phase_2_patterns(&getContext());
   TFL::populateWithGenerated(phase_2_patterns);
   phase_2_patterns.add<
       UndoBroadcastFullyConnectedBiasAddWithQDQs, FuseLogSoftmax,
-      ScalarizeSplatConstantForAdd, ScalarizeSplatConstantForSub,
-      ScalarizeSplatConstantForMul, ScalarizeSplatConstantForDiv,
       FuseFullyConnectedAndAdd, FuseAddAndFullyConnected,
       FuseFullyConnectedAndMul, FuseFullyConnectedAndReluX<TFL::ReluOp, kRelu>,
       FuseFullyConnectedAndReluX<TFL::Relu6Op, kRelu6>,
@@ -2816,13 +2858,18 @@ void OptimizePass::runOnOperation() {
       OptimizeTopK, FuseAddAndStridedSlice,
       FuseReshapeAndTransposeAroundBatchMatmul,
       FuseTransposeReshapeIntoBatchMatmul, MoveReshapeAfterFullyConnected,
-      EnableFullyConnectedKeepNumDimsBeforeReshape>(ctx);
+      EnableFullyConnectedKeepNumDimsBeforeReshape, ConvertTFLBroadcastToMulOp>(
+      ctx);
   if (!GetOptions().disable_fuse_mul_and_fc) {
     phase_2_patterns.add<FuseMulAndFullyConnected>(ctx);
   }
-  if (GetOptions().enable_canonicalization)
+  if (GetOptions().enable_canonicalization) {
     AddCanonicalizationPatterns(ctx, &phase_2_patterns);
-  (void)applyPatternsAndFoldGreedily(func, std::move(phase_2_patterns));
+  }
+  if (!GetOptions().enable_strict_qdq_mode) {
+    phase_2_patterns.add<EliminateQDQPairs>(ctx);
+  }
+  (void)applyPatternsGreedily(func, std::move(phase_2_patterns));
 }
 
 }  // namespace TFL

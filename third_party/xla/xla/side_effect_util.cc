@@ -38,6 +38,8 @@ const char kXlaMaxIdsPerPartitionAttr[] = "_xla_max_ids_per_partition";
 const char kXlaMaxUniqueIdsPerPartitionAttr[] =
     "_xla_max_unique_ids_per_partition";
 
+const char kXlaMaxValencyAttr[] = "_xla_max_valency";
+
 const char kXlaShardingStrategyAttr[] = "_xla_sharding_strategy";
 
 const char kXlaShardingStrategyMod[] = "mod";
@@ -59,6 +61,8 @@ const char kXlaBufferPlacementAttr[] = "_xla_buffer_placement";
 
 const char kXlaBufferPlacementParam[] = "arg";
 
+const char kXlaStreamAnnotationAttr[] = "_xla_stream_annotation";
+
 const char kXlaCollectiveMatmulAttr[] = "_xla_collective_matmul";
 
 const char kXlaCollectiveMatmulLhsAg[] = "lhs_ag";
@@ -67,6 +71,15 @@ const char kXlaCollectiveMatmulRhsAg[] = "rhs_ag";
 
 const char kXlaCollectiveMatmulRs[] = "rs";
 
+const char kXlaCollectiveMatmulNone[] = "none";
+
 const char kXlaMultiRecvCountAttr[] = "_xla_multi_recv_count";
 
+const char kXlaSchedulingGroupIdAttr[] = "_scheduling_group_id";
+
+const char kMustFuseAttr[] = "MUST_FUSE";
+
+const char kMaximalFuseAttr[] = "MAXIMAL_FUSE";
+
+const char kCollectivesGroupAttr[] = "_collectives_group";
 }  // namespace xla

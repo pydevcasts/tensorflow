@@ -551,10 +551,10 @@ func.func @conv1d_nsc_osi_nsc(%arg0: tensor<16x32x256xf32>, %arg1: tensor<256x1x
   func.return %0 : tensor<16x32x256xf32>
 }
 
-// CHECK: %[[RESHAPED_LHS:.*]] = "tfl.reshape"(%arg0
-// CHECK: %[[RESHAPED_RHS:.*]] = mhlo.reshape %arg1
+// CHECK: %[[RESHAPED_LHS:.*]] = "tfl.expand_dims"(%arg0
+// CHECK: %[[RESHAPED_RHS:.*]] = "tfl.expand_dims"(%arg1
 // CHECK: %[[CONV_OUT:.*]] = mhlo.convolution(%[[RESHAPED_LHS]], %[[RESHAPED_RHS]]) dim_numbers = [b, 0, 1, f]x[o, 0, 1, i]->[b, 0, 1, f]
-// CHECK: "tfl.reshape"(%[[CONV_OUT]]
+// CHECK: "tfl.squeeze"(%[[CONV_OUT]]
 
 // -----
 
@@ -573,11 +573,11 @@ func.func @conv1d_nsc_sio_nsc(%arg0: tensor<16x32x256xf32>, %arg1: tensor<1x256x
   func.return %0 : tensor<16x32x256xf32>
 }
 
-// CHECK: %[[RESHAPED_LHS:.*]] = "tfl.reshape"(%arg0
-// CHECK: %[[RESHAPED_RHS:.*]] = mhlo.reshape %arg1
+// CHECK: %[[RESHAPED_LHS:.*]] = "tfl.expand_dims"(%arg0
+// CHECK: %[[RESHAPED_RHS:.*]] = "tfl.expand_dims"(%arg1
 // CHECK: %[[TPOSED_RHS:.*]] = "mhlo.transpose"(%[[RESHAPED_RHS]]) <{permutation = dense<[3, 0, 1, 2]> : tensor<4xi64>}> : (tensor<1x1x256x256xf32>) -> tensor<256x1x1x256xf32>
 // CHECK: %[[CONV_OUT:.*]] = mhlo.convolution(%[[RESHAPED_LHS]], %[[TPOSED_RHS]]) dim_numbers = [b, 0, 1, f]x[o, 0, 1, i]->[b, 0, 1, f]
-// CHECK: "tfl.reshape"(%[[CONV_OUT]]
+// CHECK: "tfl.squeeze"(%[[CONV_OUT]]
 
 // -----
 
@@ -592,12 +592,12 @@ func.func @conv1d_ncs_osi_nsc_padded(%arg0: tensor<16x256x30xf32>, %arg1: tensor
   func.return %0 : tensor<16x32x256xf32>
 }
 
-// CHECK: %[[RESHAPED_LHS:.*]] = "tfl.reshape"(%arg0{{.*}}-> tensor<16x256x30x1xf32>
-// CHECK: %[[RESHAPED_RHS:.*]] = mhlo.reshape %arg1{{.*}}(tensor<256x1x256xf32>) -> tensor<256x1x1x256xf32>
+// CHECK: %[[RESHAPED_LHS:.*]] = "tfl.expand_dims"(%arg0{{.*}}-> tensor<16x256x30x1xf32>
+// CHECK: %[[RESHAPED_RHS:.*]] = "tfl.expand_dims"(%arg1{{.*}}-> tensor<256x1x1x256xf32>
 // CHECK: %[[TPOSED_LHS:.*]] = "mhlo.transpose"(%[[RESHAPED_LHS]]) <{permutation = dense<[0, 2, 3, 1]> : tensor<4xi64>}> : (tensor<16x256x30x1xf32>) -> tensor<16x30x1x256xf32>
-// CHECK: %[[PADDED_LHS:.*]] = "mhlo.pad"(%[[TPOSED_LHS]], %cst_0) <{edge_padding_high = dense<[0, 1, 0, 0]> : tensor<4xi64>, edge_padding_low = dense<[0, 1, 0, 0]> : tensor<4xi64>, interior_padding = dense<0> : tensor<4xi64>}> : (tensor<16x30x1x256xf32>, tensor<f32>) -> tensor<16x32x1x256xf32>
+// CHECK: %[[PADDED_LHS:.*]] = "mhlo.pad"(%[[TPOSED_LHS]], %cst) <{edge_padding_high = dense<[0, 1, 0, 0]> : tensor<4xi64>, edge_padding_low = dense<[0, 1, 0, 0]> : tensor<4xi64>, interior_padding = dense<0> : tensor<4xi64>}> : (tensor<16x30x1x256xf32>, tensor<f32>) -> tensor<16x32x1x256xf32>
 // CHECK: %[[CONV_OUT:.*]] = mhlo.convolution(%[[PADDED_LHS]], %[[RESHAPED_RHS]]) dim_numbers = [b, 0, 1, f]x[o, 0, 1, i]->[b, 0, 1, f]
-// CHECK: "tfl.reshape"(%[[CONV_OUT]]{{.*}}-> tensor<16x32x256xf32>
+// CHECK: "tfl.squeeze"(%[[CONV_OUT]]{{.*}}-> tensor<16x32x256xf32>
 
 // -----
 
@@ -612,12 +612,12 @@ func.func @conv1d_ncs_osi_nsc_padded_dynamic(%arg0: tensor<?x256x30xf32>, %arg1:
   func.return %0 : tensor<?x32x256xf32>
 }
 
-// CHECK: %[[RESHAPED_LHS:.*]] = "tfl.reshape"(%arg0{{.*}}-> tensor<?x256x30x1xf32>
-// CHECK: %[[RESHAPED_RHS:.*]] = mhlo.reshape %arg1{{.*}}(tensor<256x1x256xf32>) -> tensor<256x1x1x256xf32>
+// CHECK: %[[RESHAPED_LHS:.*]] = "tfl.expand_dims"(%arg0{{.*}}-> tensor<?x256x30x1xf32>
+// CHECK: %[[RESHAPED_RHS:.*]] = "tfl.expand_dims"(%arg1{{.*}}-> tensor<256x1x1x256xf32>
 // CHECK: %[[TPOSED_LHS:.*]] = "mhlo.transpose"(%[[RESHAPED_LHS]]) <{permutation = dense<[0, 2, 3, 1]> : tensor<4xi64>}> : (tensor<?x256x30x1xf32>) -> tensor<?x30x1x256xf32>
-// CHECK: %[[PADDED_LHS:.*]] = "mhlo.pad"(%[[TPOSED_LHS]], %cst_0) <{edge_padding_high = dense<[0, 1, 0, 0]> : tensor<4xi64>, edge_padding_low = dense<[0, 1, 0, 0]> : tensor<4xi64>, interior_padding = dense<0> : tensor<4xi64>}> : (tensor<?x30x1x256xf32>, tensor<f32>) -> tensor<?x32x1x256xf32>
+// CHECK: %[[PADDED_LHS:.*]] = "mhlo.pad"(%[[TPOSED_LHS]], %cst) <{edge_padding_high = dense<[0, 1, 0, 0]> : tensor<4xi64>, edge_padding_low = dense<[0, 1, 0, 0]> : tensor<4xi64>, interior_padding = dense<0> : tensor<4xi64>}> : (tensor<?x30x1x256xf32>, tensor<f32>) -> tensor<?x32x1x256xf32>
 // CHECK: %[[CONV_OUT:.*]] = mhlo.convolution(%[[PADDED_LHS]], %[[RESHAPED_RHS]]) dim_numbers = [b, 0, 1, f]x[o, 0, 1, i]->[b, 0, 1, f]
-// CHECK: "tfl.reshape"(%[[CONV_OUT]]{{.*}}-> tensor<?x32x256xf32>
+// CHECK: "tfl.squeeze"(%[[CONV_OUT]]{{.*}}-> tensor<?x32x256xf32>
 
 // -----
 
@@ -806,3 +806,90 @@ func.func @shape_assertion_custom_call(%arg1: tensor<?x5xi32>) -> tensor<i32> {
 }
 
 // CHECK-NOT: mhlo.custom_call
+
+//===----------------------------------------------------------------------===//
+// mhlo.fft
+//===----------------------------------------------------------------------===//
+
+// CHECK-LABEL: rfft_2d
+func.func @rfft_2d(%arg0: tensor<1x512xf32>) -> tensor<1x257xcomplex<f32>> {
+  %0 = "mhlo.fft"(%arg0) <{fft_length = dense<512> : tensor<1xi64>, fft_type = #mhlo<fft_type RFFT>}> : (tensor<1x512xf32>) -> tensor<1x257xcomplex<f32>>
+  func.return %0 : tensor<1x257xcomplex<f32>>
+}
+
+// CHECK:  %0 = "mhlo.fft"(%arg0) <{fft_length = dense<[1, 512]> : tensor<2xi64>, fft_type = #mhlo<fft_type RFFT>}> : (tensor<1x512xf32>) -> tensor<1x257xcomplex<f32>>
+// CHECK:  return %0 : tensor<1x257xcomplex<f32>>
+
+// -----
+
+// CHECK-LABEL: @fft
+func.func @fft(%arg0: tensor<3x9xcomplex<f32>>) -> tensor<3x9xcomplex<f32>> {
+  %0 = "mhlo.fft"(%arg0) <{ fft_length = dense<9> : tensor<1xi64>, fft_type = #mhlo<fft_type FFT> }> : (tensor<3x9xcomplex<f32>>) -> tensor<3x9xcomplex<f32>>
+  func.return %0 : tensor<3x9xcomplex<f32>>
+}
+
+// CHECK: %0 = "mhlo.fft"(%arg0) <{fft_length = dense<9> : tensor<1xi64>, fft_type = #mhlo<fft_type FFT>}> : (tensor<3x9xcomplex<f32>>) -> tensor<3x9xcomplex<f32>>
+// CHECK: return %0 : tensor<3x9xcomplex<f32>>
+
+// -----
+
+// CHECK-LABEL: @mhlo_nd_fft
+func.func @mhlo_nd_fft(%arg0: tensor<2x3x345x256xf32>) -> tensor<2x3x345x129xcomplex<f32>> {
+  %43 = "mhlo.fft"(%arg0) <{fft_length = dense<256> : tensor<1xi64>, fft_type = #mhlo<fft_type RFFT>}> : (tensor<2x3x345x256xf32>) -> tensor<2x3x345x129xcomplex<f32>>
+  return %43 : tensor<2x3x345x129xcomplex<f32>>
+}
+
+// CHECK: %0 = mhlo.reshape %arg0 : (tensor<2x3x345x256xf32>) -> tensor<2x3x345x1x256xf32>
+// CHECK: %1 = "mhlo.fft"(%0) <{fft_length = dense<[1, 256]> : tensor<2xi64>, fft_type = #mhlo<fft_type RFFT>}> : (tensor<2x3x345x1x256xf32>) -> tensor<2x3x345x1x129xcomplex<f32>>
+// CHECK: %2 = mhlo.reshape %1 : (tensor<2x3x345x1x129xcomplex<f32>>) -> tensor<2x3x345x129xcomplex<f32>>
+// CHECK: return %2 : tensor<2x3x345x129xcomplex<f32>>
+
+// -----
+
+// CHECK-LABEL: @mhlo_dynamic_fft_1
+func.func @mhlo_dynamic_fft_1(%arg0: tensor<?x9x2560xf32>) -> tensor<?x9x1281xcomplex<f32>> {
+  %0 = "mhlo.fft"(%arg0) <{fft_length = dense<2560> : tensor<1xi64>, fft_type = #mhlo<fft_type RFFT>}> : (tensor<?x9x2560xf32>) -> tensor<?x9x1281xcomplex<f32>>
+  return %0 : tensor<?x9x1281xcomplex<f32>>
+  // CHECK: %4 = "mhlo.get_dimension_size"(%arg0) <{dimension = 0 : i64}> : (tensor<?x9x2560xf32>) -> tensor<i32>
+  // CHECK: %5 = mhlo.reshape %4 : (tensor<i32>) -> tensor<1xi32>
+  // CHECK: %6 = "mhlo.concatenate"(%5, %3, %2, %1) <{dimension = 0 : i64}> : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<4xi32>
+  // CHECK: %7 = mhlo.dynamic_reshape %arg0, %6 : (tensor<?x9x2560xf32>, tensor<4xi32>) -> tensor<?x9x1x2560xf32>
+  // CHECK: %8 = "mhlo.fft"(%7) <{fft_length = dense<[1, 2560]> : tensor<2xi64>, fft_type = #mhlo<fft_type RFFT>}> : (tensor<?x9x1x2560xf32>) -> tensor<?x9x1x1281xcomplex<f32>>
+  // CHECK: %9 = "mhlo.get_dimension_size"(%8) <{dimension = 0 : i64}> : (tensor<?x9x1x1281xcomplex<f32>>) -> tensor<i32>
+  // CHECK: %10 = mhlo.reshape %9 : (tensor<i32>) -> tensor<1xi32>
+  // CHECK: %11 = "mhlo.concatenate"(%10, %3, %0) <{dimension = 0 : i64}> : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<3xi32>
+  // CHECK: %12 = mhlo.dynamic_reshape %8, %11 : (tensor<?x9x1x1281xcomplex<f32>>, tensor<3xi32>) -> tensor<?x9x1281xcomplex<f32>>
+  // CHECK: return %12 : tensor<?x9x1281xcomplex<f32>>
+}
+
+// -----
+
+// CHECK-LABEL: @mhlo_dynamic_fft_2
+func.func @mhlo_dynamic_fft_2(%arg0: tensor<?x?x2560xf32>) -> tensor<?x?x1281xcomplex<f32>> {
+  %0 = "mhlo.fft"(%arg0) <{fft_length = dense<2560> : tensor<1xi64>, fft_type = #mhlo<fft_type RFFT>}> : (tensor<?x?x2560xf32>) -> tensor<?x?x1281xcomplex<f32>>
+  return %0 : tensor<?x?x1281xcomplex<f32>>
+  // CHECK: %3 = "mhlo.get_dimension_size"(%arg0) <{dimension = 0 : i64}> : (tensor<?x?x2560xf32>) -> tensor<i32>
+  // CHECK: %4 = mhlo.reshape %3 : (tensor<i32>) -> tensor<1xi32>
+  // CHECK: %5 = "mhlo.get_dimension_size"(%arg0) <{dimension = 1 : i64}> : (tensor<?x?x2560xf32>) -> tensor<i32>
+  // CHECK: %6 = mhlo.reshape %5 : (tensor<i32>) -> tensor<1xi32>
+  // CHECK: %7 = "mhlo.concatenate"(%4, %6, %2, %1) <{dimension = 0 : i64}> : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<4xi32>
+  // CHECK: %8 = mhlo.dynamic_reshape %arg0, %7 : (tensor<?x?x2560xf32>, tensor<4xi32>) -> tensor<?x?x1x2560xf32>
+  // CHECK: %9 = "mhlo.fft"(%8) <{fft_length = dense<[1, 2560]> : tensor<2xi64>, fft_type = #mhlo<fft_type RFFT>}> : (tensor<?x?x1x2560xf32>) -> tensor<?x?x1x1281xcomplex<f32>>
+  // CHECK: %10 = "mhlo.get_dimension_size"(%9) <{dimension = 0 : i64}> : (tensor<?x?x1x1281xcomplex<f32>>) -> tensor<i32>
+  // CHECK: %11 = mhlo.reshape %10 : (tensor<i32>) -> tensor<1xi32>
+  // CHECK: %12 = "mhlo.get_dimension_size"(%9) <{dimension = 1 : i64}> : (tensor<?x?x1x1281xcomplex<f32>>) -> tensor<i32>
+  // CHECK: %13 = mhlo.reshape %12 : (tensor<i32>) -> tensor<1xi32>
+  // CHECK: %14 = "mhlo.concatenate"(%11, %13, %0) <{dimension = 0 : i64}> : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<3xi32>
+  // CHECK: %15 = mhlo.dynamic_reshape %9, %14 : (tensor<?x?x1x1281xcomplex<f32>>, tensor<3xi32>) -> tensor<?x?x1281xcomplex<f32>>
+  // CHECK: return %15 : tensor<?x?x1281xcomplex<f32>>
+}
+
+// -----
+
+// CHECK-LABEL: @mhlo_dynamic_fft_2_neg
+func.func @mhlo_dynamic_fft_2_neg(%arg0: tensor<?x9x?xf32>) -> tensor<?x9x1281xcomplex<f32>> {
+  %0 = "mhlo.fft"(%arg0) <{fft_length = dense<2560> : tensor<1xi64>, fft_type = #mhlo<fft_type RFFT>}> : (tensor<?x9x?xf32>) -> tensor<?x9x1281xcomplex<f32>>
+  return %0 : tensor<?x9x1281xcomplex<f32>>
+  // CHECK: %0 = "mhlo.fft"(%arg0) <{fft_length = dense<2560> : tensor<1xi64>, fft_type = #mhlo<fft_type RFFT>}> : (tensor<?x9x?xf32>) -> tensor<?x9x1281xcomplex<f32>>
+  // CHECK: return %0 : tensor<?x9x1281xcomplex<f32>>
+}

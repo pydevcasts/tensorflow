@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <string>
 
+#include "absl/status/status.h"
 #include "tensorflow/cc/saved_model/image_format/internal_api.h"
 #include "tensorflow/core/platform/path.h"
 #include "tensorflow/core/platform/status.h"
@@ -39,7 +40,7 @@ absl::string_view GetNameWithoutExtension(absl::string_view filename) {
 }  // namespace
 
 bool IsTextProto(const std::string& input_file) {
-  tensorflow::StringPiece extension = tensorflow::io::Extension(input_file);
+  absl::string_view extension = tensorflow::io::Extension(input_file);
   return !extension.compare("pbtxt");
 }
 

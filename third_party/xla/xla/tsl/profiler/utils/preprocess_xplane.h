@@ -30,7 +30,6 @@ limitations under the License.
 #include "absl/memory/memory.h"
 #include "absl/strings/match.h"
 #include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
 #include "xla/tsl/profiler/utils/tpu_xplane_utils.h"
 #include "xla/tsl/profiler/utils/trace_utils.h"
 #include "xla/tsl/profiler/utils/xplane_builder.h"
@@ -409,7 +408,7 @@ class TpuModuleLineMutatorFactory : public XplaneEventMutatorFactory {
         // consistent with other kTpuLaunch types.
         std::vector<std::variant<absl::string_view, uint64_t>> required_stats;
         required_stats.reserve(4);
-        required_stats.emplace_back(device_ordinal_);
+        required_stats.push_back(device_ordinal_);
         required_stats.emplace_back(*queue_id);
         required_stats.emplace_back(*run_id);
         required_stats.emplace_back(static_cast<uint64_t>(*core_type));
@@ -501,7 +500,7 @@ class ThreadpoolLineMutatorFactory : public XplaneEventMutatorFactory {
           metadata.start_region_timestamp_ps = start_region_timestamp_ps;
           metadata.region_id = region_id;
           metadata.end_region_timestamp_ps = event.TimestampPs();
-          event_metadata.emplace_back(metadata);
+          event_metadata.push_back(metadata);
         }
       });
       for (const auto& event_metadata : event_metadata) {

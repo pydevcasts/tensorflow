@@ -1223,6 +1223,12 @@ cudnn_frontend::DataType_t ToCudnnFrontendDataType(
     case dnn::DataType::kF8E5M2:
       return cudnn_frontend::DataType_t::FP8_E5M2;
 #endif
+#if CUDNN_VERSION >= 90700
+    case dnn::DataType::kF4E2M1FN:
+      return cudnn_frontend::DataType_t::FP4_E2M1;
+    case dnn::DataType::kF8E8M0FNU:
+      return cudnn_frontend::DataType_t::FP8_E8M0;
+#endif
     default:
       LOG(FATAL) << "Invalid DNN data type: " << static_cast<int>(data_type);
   }
@@ -3975,6 +3981,12 @@ OpNameStringToOperandKindAndMode(std::string opstring) {
 
   KINDS_AND_MODE_FROM_OP_STRING("add", TensorKind::kTensor, TensorKind::kTensor,
                                 CUDNN_POINTWISE_ADD)
+  KINDS_AND_MODE_FROM_OP_STRING("min", TensorKind::kTensor, TensorKind::kTensor,
+                                CUDNN_POINTWISE_MIN)
+  KINDS_AND_MODE_FROM_OP_STRING("max", TensorKind::kTensor, TensorKind::kTensor,
+                                CUDNN_POINTWISE_MAX)
+  KINDS_AND_MODE_FROM_OP_STRING("elu", TensorKind::kNone, TensorKind::kTensor,
+                                CUDNN_POINTWISE_ELU_FWD)
   KINDS_AND_MODE_FROM_OP_STRING("relu", TensorKind::kNone, TensorKind::kTensor,
                                 CUDNN_POINTWISE_RELU_FWD)
   KINDS_AND_MODE_FROM_OP_STRING("scale", TensorKind::kScalar,
@@ -3992,11 +4004,10 @@ OpNameStringToOperandKindAndMode(std::string opstring) {
 // graph.
 struct OpDescriptor {
   int uid;                         // The UID of the op.
-  std::optional<int> operand_uid;  // The UID of the at most one operand of the
-                                   // op which is part of the graph.
+  std::vector<int> operand_uids;   // The UIDs of the operands of the op that
+                                   // are part of the graph.
   OpMode mode;                     // The mode describing the op.
-  TensorKind operand_kind;    // The kind of a second operand (side input) not
-                              // represented in the graph.
+  TensorKind operand_kind;         // The kind of a second operand.
   TensorKind result_kind;     // The kind of the output.
   dnn::DataType result_type;  // The type of the output.
   bool is_virtual;            // A virtual op has a user within the graph.
@@ -4009,13 +4020,13 @@ class OpGraph {
  public:
   OpGraph() = default;
 
-  absl::Status AddOp(int uid, std::optional<int> operand_uid, OpMode mode,
+  absl::Status AddOp(int uid, std::vector<int> operand_uids, OpMode mode,
                      TensorKind operand_kind, TensorKind result_kind,
                      dnn::DataType result_type) {
-    ops_.emplace_back(OpDescriptor({uid, operand_uid, mode, operand_kind,
+    ops_.emplace_back(OpDescriptor({uid, operand_uids, mode, operand_kind,
                                     result_kind, result_type, false, -1}));
-    // If it exists, the operand is virtual.
-    if (operand_uid.has_value()) {
+    // If they exist, the operands are virtual.
+    for (int operand_uid : operand_uids) {
       auto it = std::find_if(
           ops_.begin(), ops_.end(),
           [operand_uid](OpDescriptor op) { return op.uid == operand_uid; });
@@ -4080,8 +4091,8 @@ GetGenericCudnnOperationGraph(
 
   // The format of the serialized graph describing a sequence of ops fused
   // into the cuDNN convolution Custom Call is
-  // "UID:[output_type]conv();UID[output_type]:op_name(operand
-  // UID);UID:[output_type]op_name(operand UID);..." with the convolution
+  // "UID:[output_type]conv();UID:[output_type]op_name(operand
+  // UIDs);UID:[output_type]op_name(operand UIDs);..." with the convolution
   // assumed to be the first op in the graph. Operand UIDs identifying ops
   // outside the serialized graph are elided.
   auto deserialize_cudnn_graph = [&]() -> absl::StatusOr<OpGraph> {
@@ -4096,10 +4107,16 @@ GetGenericCudnnOperationGraph(
       std::string data_type_string = serialized_graph.substr(m + 1, n - m - 1);
       m = serialized_graph.find('(', pos);
       std::string op_string = serialized_graph.substr(n + 1, m - n - 1);
-      std::optional<int> operand;
-      std::string::size_type l = serialized_graph.find(')', m + 1);
-      if (l > m + 1) {
-        operand = std::stoi(serialized_graph.substr(m + 1, l - m - 1));
+      std::vector<int> operands;
+      std::string::size_type l = serialized_graph.find_first_of(",)", m + 1);
+      while (l > m + 1) {
+        operands.push_back(
+            std::stoi(serialized_graph.substr(m + 1, l - m - 1)));
+        if (serialized_graph[l] == ')') {
+          break;
+        }
+        m = l;
+        l = serialized_graph.find_first_of(",)", m + 1);
       }
 
       if (serialized_graph[l + 1] != ';') {
@@ -4116,7 +4133,7 @@ GetGenericCudnnOperationGraph(
           return tsl::errors::Internal(
               "The graph must not contain more than one convolution op.");
         }
-        if (operand.has_value()) {
+        if (!operands.empty()) {
           return tsl::errors::Internal(
               "Convolution op must not have operands in the graph.");
         }
@@ -4130,15 +4147,16 @@ GetGenericCudnnOperationGraph(
           return tsl::errors::Internal(
               "The first op in the graph must be a convolution.");
         }
-        if (!operand.has_value()) {
+        if (operands.empty()) {
           return tsl::errors::Internal(
-              "Non-convolution op must have one operand in the graph.");
+              "Non-convolution op must have one or more operands in the "
+              "graph.");
         }
         TF_ASSIGN_OR_RETURN(std::tie(binary_operand_kind, output_kind, mode),
                             OpNameStringToOperandKindAndMode(op_string));
       }
-      TF_RETURN_IF_ERROR(op_graph.AddOp(uid, operand, mode, binary_operand_kind,
-                                        output_kind, output_type));
+      TF_RETURN_IF_ERROR(op_graph.AddOp(
+          uid, operands, mode, binary_operand_kind, output_kind, output_type));
     }
     return op_graph;
   };
@@ -4150,6 +4168,7 @@ GetGenericCudnnOperationGraph(
 
   std::vector<int64_t> virtual_uids, operand_uids, output_uids;
   std::vector<cudnn_frontend::Operation> ops;
+  std::vector<cudnn_frontend::Tensor> result_tensors;
 
   auto next_uid = [&operand_uids, &output_uids, &virtual_uids](
                       bool is_operand, bool is_virtual) -> int64_t {
@@ -4170,12 +4189,13 @@ GetGenericCudnnOperationGraph(
         std::max({max_operand_uid, max_output_uid, max_virtual_uid}) + 1;
 
     if (is_operand) {
-      return operand_uids.emplace_back(next_uid);
+      operand_uids.push_back(next_uid);
+    } else if (is_virtual) {
+      virtual_uids.push_back(next_uid);
+    } else {
+      output_uids.push_back(next_uid);
     }
-    if (is_virtual) {
-      return virtual_uids.emplace_back(next_uid);
-    }
-    return output_uids.emplace_back(next_uid);
+    return next_uid;
   };
 
   //  Input tensor.
@@ -4261,61 +4281,71 @@ GetGenericCudnnOperationGraph(
                                      .setBeta(beta)
                                      .build();
   RETURN_MSG_IF_CUDNN_ERROR(op);
-  // Add the convolution to the cuDNN graph.
-  ops.push_back(std::move(op));
-  TF_RETURN_IF_ERROR(
-      op_graph.SetSequenceIndex(op_descriptor.uid, ops.size() - 1));
 
   VLOG(4) << "\nTensor_x: " << tensor_x.describe()
           << "\nTensor_y: " << tensor_y.describe()
           << "\nTensor_w: " << tensor_w.describe()
           << "\nConv desc: " << conv_desc.describe()
-          << "\nOp: " << ops.back().describe();
+          << "\nOp: " << op.describe();
+
+  // Add the convolution to the cuDNN graph.
+  ops.push_back(std::move(op));
+  result_tensors.push_back(std::move(tensor_y));
+  TF_RETURN_IF_ERROR(
+      op_graph.SetSequenceIndex(op_descriptor.uid, ops.size() - 1));
 
   for (int op_index = 1; op_index < op_graph.Size(); ++op_index) {
     TF_ASSIGN_OR_RETURN(op_descriptor, op_graph.OpDescriptorAt(op_index));
-    TF_ASSIGN_OR_RETURN(
-        OpDescriptor preceding_op,
-        op_graph.FindOpDescriptor(op_descriptor.operand_uid.value()));
-    std::optional<cudnn_frontend::Tensor> second_operand, result;
+    std::vector<OpDescriptor> preceding_ops;
+    preceding_ops.reserve(op_descriptor.operand_uids.size());
+    for (int operand_uid : op_descriptor.operand_uids) {
+      preceding_ops.emplace_back(
+          op_graph.FindOpDescriptor(operand_uid).value());
+    }
+    std::optional<cudnn_frontend::Tensor> external_operand;
 
-    // Create cuDNN tensors for operands of binary ops (side inputs).
-    if (op_descriptor.operand_kind == TensorKind::kScalar) {
+    // Create a cuDNN tensor for the potential non-graph operand of
+    // non-convolution binary ops (side input).
+    if (op_descriptor.operand_kind == TensorKind::kScalar &&
+        preceding_ops.size() == 1) {
       std::vector<int64_t> scale_dim(4, 1);
       TF_ASSIGN_OR_RETURN(
-          second_operand,
+          external_operand,
           CreateCudnnTensor(scale_dim, scale_dim,
                             next_uid(/*is_operand=*/true, /*is_virtual=*/false),
-                            preceding_op.result_type, 1, -1));
-      VLOG(4) << "\nPointwise operand: " << second_operand->describe();
-    } else if (op_descriptor.operand_kind == TensorKind::kTensor) {
+                            preceding_ops[0].result_type, 1, -1));
+      VLOG(4) << "\nPointwise operand: " << external_operand->describe();
+    } else if (op_descriptor.operand_kind == TensorKind::kTensor &&
+               preceding_ops.size() == 1) {
       TF_ASSIGN_OR_RETURN(
-          second_operand,
+          external_operand,
           CreateCudnnTensor(tensor_y,
                             next_uid(/*is_operand=*/true, /*is_virtual=*/false),
-                            preceding_op.result_type,
+                            preceding_ops[0].result_type,
                             /*is_virtual=*/false));
-      VLOG(4) << "\nPointwise operand: " << second_operand->describe();
+      VLOG(4) << "\nPointwise operand: " << external_operand->describe();
     }
 
     // Create the result tensor of the op.
     if (op_descriptor.result_kind == TensorKind::kScalar) {
       std::vector<int64_t> scale_dim(4, 1);
-      TF_ASSIGN_OR_RETURN(
-          result, CreateCudnnTensor(
-                      scale_dim, scale_dim,
-                      next_uid(/*is_operand=*/false, /*is_virtual=*/false),
-                      op_descriptor.result_type, 1, -1));
-      VLOG(4) << "\nScalar result: " << result->describe();
+      TF_ASSIGN_OR_RETURN(cudnn_frontend::Tensor result,
+                          CreateCudnnTensor(scale_dim, scale_dim,
+                                            next_uid(/*is_operand=*/false,
+                                                     /*is_virtual=*/false),
+                                            op_descriptor.result_type, 1, -1));
+      VLOG(4) << "\nScalar result: " << result.describe();
+      result_tensors.push_back(std::move(result));
     } else if (op_descriptor.result_kind == TensorKind::kTensor) {
       TF_ASSIGN_OR_RETURN(
-          result,
+          cudnn_frontend::Tensor result,
           CreateCudnnTensor(tensor_y,
                             next_uid(/*is_operand=*/false,
                                      /*is_virtual=*/op_descriptor.is_virtual),
                             op_descriptor.result_type,
                             /*is_virtual=*/op_descriptor.is_virtual));
-      VLOG(4) << "\nTensor result: " << result->describe();
+      VLOG(4) << "\nTensor result: " << result.describe();
+      result_tensors.push_back(std::move(result));
     }
 
     if (std::holds_alternative<cudnnPointwiseMode_t>(op_descriptor.mode)) {
@@ -4327,22 +4357,30 @@ GetGenericCudnnOperationGraph(
               .build();
       VLOG(4) << "\nPointwise op desc: " << desc.describe();
       // Add the op to the operation graph.
-      if (second_operand.has_value()) {
+      if (external_operand.has_value()) {
         ops.emplace_back(
             cudnn_frontend::OperationBuilder(
                 CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
-                .setxDesc(ops[preceding_op.sequence_index].getOutputTensor())
-                .setbDesc(second_operand.value())
-                .setyDesc(result.value())
+                .setxDesc(result_tensors[preceding_ops[0].sequence_index])
+                .setbDesc(external_operand.value())
+                .setyDesc(result_tensors.back())
                 .setpwDesc(desc)
                 .build());
-
+      } else if (preceding_ops.size() == 2) {
+        ops.emplace_back(
+            cudnn_frontend::OperationBuilder(
+                CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
+                .setxDesc(result_tensors[preceding_ops[0].sequence_index])
+                .setbDesc(result_tensors[preceding_ops[1].sequence_index])
+                .setyDesc(result_tensors.back())
+                .setpwDesc(desc)
+                .build());
       } else {
         ops.emplace_back(
             cudnn_frontend::OperationBuilder(
                 CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
-                .setxDesc(ops[preceding_op.sequence_index].getOutputTensor())
-                .setyDesc(result.value())
+                .setxDesc(result_tensors[preceding_ops[0].sequence_index])
+                .setyDesc(result_tensors.back())
                 .setpwDesc(desc)
                 .build());
       }
@@ -4361,8 +4399,8 @@ GetGenericCudnnOperationGraph(
       ops.emplace_back(
           cudnn_frontend::OperationBuilder(
               CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR)
-              .setxDesc(ops[preceding_op.sequence_index].getOutputTensor())
-              .setyDesc(result.value())
+              .setxDesc(result_tensors[preceding_ops[0].sequence_index])
+              .setyDesc(result_tensors.back())
               .setreductionDesc(desc)
               .build());
     }
@@ -4384,7 +4422,7 @@ GetGenericCudnnOperationGraph(
   non_virtual_uids.insert(non_virtual_uids.end(), output_uids.begin(),
                           output_uids.end());
 
-  return make_pair(
+  return std::make_pair(
       std::make_unique<cudnn_frontend::OperationGraph>(std::move(opGraph)),
       non_virtual_uids);
 }
@@ -4875,9 +4913,8 @@ static absl::StatusOr<cudnn_frontend::ExecutionPlan> GetExecPlanFromHeuristics(
         engine_configs, true);
   }
 
-  if (VLOG_IS_ON(4)) {
-    VLOG(4) << "Heuristic has " << engine_configs.size() << " configurations ";
-  }
+  VLOG(4) << "Heuristic has " << engine_configs.size() << " configurations ";
+
   if (engine_configs.empty()) {
     return absl::InternalError(
         "No engine configurations found for this opGraph and heuristics.");
@@ -4964,6 +5001,10 @@ static absl::StatusOr<cudnn_frontend::ExecutionPlan> RebuildExecutionPlan(
 
 }  // namespace
 
+void FixDimsForRaggedOffset(std::vector<int64_t>& dims, int max_reg_per_batch) {
+  dims[0] *= max_reg_per_batch;
+}
+
 absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
     dnn::DnnSupport& dnn_support,
     const dnn::MatmulTensorDescriptor& q_descriptor,
@@ -4973,21 +5014,20 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
     const std::optional<dnn::TensorDescriptor> bias_descriptor,
     const std::optional<dnn::TensorDescriptor> stats_descriptor, double scale,
     const bool use_dropout, const std::optional<double> dropout_rate,
-    const dnn::FMHAMaskKind mask_type, const int sliding_window_length) {
+    const dnn::FMHAMaskKind mask_type, const int sliding_window_length,
+    const int max_seg_per_batch) {
   using cudnn_frontend::graph::Tensor_attributes;
 
 #if CUDNN_VERSION >= 90000
-  if (VLOG_IS_ON(4)) {
-    VLOG(4) << "\n bmm1_lhs(q): " << q_descriptor.ToString()
-            << "\n bmm1_rhs(k): " << k_descriptor.ToString()
-            << "\n bmm2_rhs(v): " << v_descriptor.ToString()
-            << "\n out(o): " << o_descriptor.ToString();
-    if (bias_descriptor) {
-      VLOG(4) << "\n bias(b): " << bias_descriptor->ToString();
-    }
-    if (stats_descriptor) {
-      VLOG(4) << "\n activation(s): " << stats_descriptor->ToString();
-    }
+  VLOG(4) << "\n bmm1_lhs(q): " << q_descriptor.ToString()
+          << "\n bmm1_rhs(k): " << k_descriptor.ToString()
+          << "\n bmm2_rhs(v): " << v_descriptor.ToString()
+          << "\n out(o): " << o_descriptor.ToString();
+  if (bias_descriptor) {
+    VLOG(4) << "\n bias(b): " << bias_descriptor->ToString();
+  }
+  if (stats_descriptor) {
+    VLOG(4) << "\n activation(s): " << stats_descriptor->ToString();
   }
 
   cudnn_frontend::graph::Graph graph;
@@ -5006,23 +5046,34 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
 
   auto next_uid = [uid = 0]() mutable -> int { return CuDnnTensorUID(uid++); };
 
+  std::vector<int64_t> q_dims = q_descriptor.GetCudnnCompatibleDimensions(true);
+  std::vector<int64_t> k_dims = k_descriptor.GetCudnnCompatibleDimensions(true);
+  std::vector<int64_t> v_dims =
+      v_descriptor.GetCudnnCompatibleDimensions(false);
+
+  if (max_seg_per_batch > 1) {
+    FixDimsForRaggedOffset(q_dims, max_seg_per_batch);
+    FixDimsForRaggedOffset(k_dims, max_seg_per_batch);
+    FixDimsForRaggedOffset(v_dims, max_seg_per_batch);
+  }
+
   std::shared_ptr<Tensor_attributes> q_tensor =
       graph.tensor(Tensor_attributes()
                        .set_name("Q")
-                       .set_dim(q_descriptor.GetCudnnCompatibleDimensions(true))
+                       .set_dim(q_dims)
                        .set_stride(q_descriptor.GetCudnnCompatibleStrides(true))
                        .set_uid(next_uid()));
 
   std::shared_ptr<Tensor_attributes> k_tensor =
       graph.tensor(Tensor_attributes()
                        .set_name("K")
-                       .set_dim(k_descriptor.GetCudnnCompatibleDimensions(true))
+                       .set_dim(k_dims)
                        .set_stride(k_descriptor.GetCudnnCompatibleStrides(true))
                        .set_uid(next_uid()));
   std::shared_ptr<Tensor_attributes> v_tensor = graph.tensor(
       Tensor_attributes()
           .set_name("V")
-          .set_dim(v_descriptor.GetCudnnCompatibleDimensions(false))
+          .set_dim(v_dims)
           .set_stride(v_descriptor.GetCudnnCompatibleStrides(false))
           .set_uid(next_uid()));
 
@@ -5048,9 +5099,9 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
   // Setting actual seqlen
   bool is_padding = mask_type == dnn::FMHAMaskKind::PADDING ||
                     mask_type == dnn::FMHAMaskKind::PADDING_CAUSAL;
-  if (is_padding) {
-    auto q_dim = q_descriptor.GetCudnnCompatibleDimensions(true);
-    auto b = q_dim[0];
+  if (is_padding || max_seg_per_batch > 1) {
+    // Get batch size
+    auto b = q_dims[0];
     auto seq_q_tensor =
         graph.tensor(Tensor_attributes()
                          .set_name("seq_q")
@@ -5069,6 +5120,30 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
     sdpa_options.set_seq_len_q(seq_q_tensor);
     sdpa_options.set_seq_len_kv(seq_kv_tensor);
   }
+
+  std::shared_ptr<Tensor_attributes> offset_q;
+  if (max_seg_per_batch > 1) {
+    // Get batch size
+    auto b = q_dims[0];
+    offset_q =
+        graph.tensor(Tensor_attributes()
+                         .set_name("offset_q")
+                         .set_dim({b + 1, 1, 1, 1})
+                         .set_stride({1, 1, 1, 1})
+                         .set_uid(next_uid())
+                         .set_data_type(cudnn_frontend::DataType_t::INT32));
+    auto offset_kv =
+        graph.tensor(Tensor_attributes()
+                         .set_name("offset_kv")
+                         .set_dim({b + 1, 1, 1, 1})
+                         .set_stride({1, 1, 1, 1})
+                         .set_uid(next_uid())
+                         .set_data_type(cudnn_frontend::DataType_t::INT32));
+    q_tensor->set_ragged_offset(offset_q);
+    k_tensor->set_ragged_offset(offset_kv);
+    v_tensor->set_ragged_offset(offset_kv);
+  }
+
   // Setting seed and offset
   std::shared_ptr<Tensor_attributes> seed_tensor;
   std::shared_ptr<Tensor_attributes> offset_tensor;
@@ -5099,10 +5174,16 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
   auto [o_tensor, stats_tensor] =
       graph.sdpa(q_tensor, k_tensor, v_tensor, sdpa_options);
 
+  auto o_dims = o_descriptor.dimensions();
+
+  if (max_seg_per_batch > 1) {
+    FixDimsForRaggedOffset(o_dims, max_seg_per_batch);
+    o_tensor->set_ragged_offset(offset_q);
+  }
   // Set output attributes.
   o_tensor->set_name("O")
       .set_output(true)
-      .set_dim(o_descriptor.dimensions())
+      .set_dim(o_dims)
       .set_stride(o_descriptor.GetLogicalStrides())
       .set_uid(next_uid());
   if (stats_descriptor.has_value()) {
@@ -5131,9 +5212,7 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
                                   /*allow_tf32=*/true}));
   TF_RETURN_IF_ERROR(cudnnGraph.Build(dnn_support, /*plan_id=*/std::nullopt));
 
-  if (VLOG_IS_ON(4)) {
-    VLOG(4) << "\b flash attention operation graph: " << graph;
-  }
+  VLOG(4) << "\b flash attention operation graph: " << cudnnGraph.Graph();
   return cudnnGraph;
 #else
   return absl::UnimplementedError(
@@ -5152,16 +5231,12 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionF8OperationGraph(
   using cudnn_frontend::graph::Tensor_attributes;
 
 #if CUDNN_VERSION >= 90100
-  if (VLOG_IS_ON(4)) {
-    VLOG(4) << "\n bmm1_lhs(q): " << q_descriptor.ToString()
-            << "\n bmm1_rhs(k): " << k_descriptor.ToString()
-            << "\n bmm2_rhs(v): " << v_descriptor.ToString()
-            << "\n out(o): " << o_descriptor.ToString()
-            << "\n scale: " << scale;
-
-    if (stats_descriptor) {
-      VLOG(4) << "\n activation(s): " << stats_descriptor->ToString();
-    }
+  VLOG(4) << "\n bmm1_lhs(q): " << q_descriptor.ToString()
+          << "\n bmm1_rhs(k): " << k_descriptor.ToString()
+          << "\n bmm2_rhs(v): " << v_descriptor.ToString()
+          << "\n out(o): " << o_descriptor.ToString() << "\n scale: " << scale;
+  if (stats_descriptor) {
+    VLOG(4) << "\n activation(s): " << stats_descriptor->ToString();
   }
 
   cudnn_frontend::graph::Graph graph;
@@ -5269,10 +5344,9 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionF8OperationGraph(
                                   /*allow_tf32=*/true}));
   TF_RETURN_IF_ERROR(cudnnGraph.Build(dnn_support, /*plan_id=*/std::nullopt));
 
-  if (VLOG_IS_ON(4)) {
-    VLOG(4) << "\b workspace size:" << cudnnGraph.Graph().get_workspace_size();
-    VLOG(4) << "\b flash attention operation graph: " << cudnnGraph.Graph();
-  }
+  VLOG(4) << "\b workspace size:" << cudnnGraph.Graph().get_workspace_size();
+  VLOG(4) << "\b flash attention operation graph: " << cudnnGraph.Graph();
+
   return cudnnGraph;
 #else
   return absl::UnimplementedError(
@@ -5290,17 +5364,16 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardF8OperationGraph(
     const dnn::TensorDescriptor& dv_desc, double scale,
     dnn::FMHAMaskKind mask_type) {
 #if CUDNN_VERSION >= 90100
-  if (VLOG_IS_ON(4)) {
-    VLOG(4) << "\n bmm1_grad_gemm1_rhs(q): " << q_desc.ToString()
-            << "\n bmm1_grad_gemm2_rhs(k): " << k_desc.ToString()
-            << "\n bmm2_grad_gemm1_lhs(p): " << p_desc.ToString()
-            << "\n bmm2_grad_gemm2_rhs(v^t): " << v_desc.ToString()
-            << "\n d_output(do): " << do_desc.ToString()
-            << "\n d_bmm1_lhs(dq): " << dq_desc.ToString()
-            << "\n d_bmm1_rhs(dk): " << dk_desc.ToString()
-            << "\n d_bmm2_rhs(dv): " << dv_desc.ToString()
-            << "\n scale: " << scale;
-  }
+  VLOG(4) << "\n bmm1_grad_gemm1_rhs(q): " << q_desc.ToString()
+          << "\n bmm1_grad_gemm2_rhs(k): " << k_desc.ToString()
+          << "\n bmm2_grad_gemm1_lhs(p): " << p_desc.ToString()
+          << "\n bmm2_grad_gemm2_rhs(v^t): " << v_desc.ToString()
+          << "\n d_output(do): " << do_desc.ToString()
+          << "\n d_bmm1_lhs(dq): " << dq_desc.ToString()
+          << "\n d_bmm1_rhs(dk): " << dk_desc.ToString()
+          << "\n d_bmm2_rhs(dv): " << dv_desc.ToString()
+          << "\n scale: " << scale;
+
   using cudnn_frontend::graph::Tensor_attributes;
   cudnn_frontend::graph::Graph graph;
   if (!(q_desc.type() == k_desc.type() && v_desc.type() == do_desc.type() &&
@@ -5464,15 +5537,99 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardF8OperationGraph(
                                   /*allow_tf32=*/true}));
   TF_RETURN_IF_ERROR(cudnnGraph.Build(dnn_support, /*plan_id=*/std::nullopt));
 
-  if (VLOG_IS_ON(4)) {
-    VLOG(4) << "\b workspace size:" << cudnnGraph.Graph().get_workspace_size();
-    VLOG(4) << "\b flash attention f8 operation backward graph: " << graph;
-  }
+  VLOG(4) << "\b workspace size:" << cudnnGraph.Graph().get_workspace_size();
+  VLOG(4) << "\b flash attention f8 operation backward graph: "
+          << cudnnGraph.Graph();
 
   return cudnnGraph;
 #else
   return absl::UnimplementedError(
       "Cudnn flash attention only supported with Cudnn >= 9.1.0");
+#endif
+}
+
+absl::StatusOr<CudnnGraph> GetCudnnBlockScaledDotOperationGraph(
+    dnn::DnnSupport& dnn_support, const dnn::TensorDescriptor& lhs_data,
+    const dnn::TensorDescriptor& lhs_scale,
+    const dnn::TensorDescriptor& rhs_data,
+    const dnn::TensorDescriptor& rhs_scale, dnn::DataType result_type,
+    int block_size) {
+#if CUDNN_VERSION >= 90700
+  using cudnn_frontend::graph::Block_scale_dequantize_attributes;
+  using cudnn_frontend::graph::Matmul_attributes;
+  using cudnn_frontend::graph::Tensor_attributes;
+
+  VLOG(4) << "\n lhs_data: " << lhs_data.ToString()
+          << "\n lhs_scale: " << lhs_scale.ToString()
+          << "\n rhs_data: " << rhs_data.ToString()
+          << "\n rhs_scale: " << rhs_scale.ToString()
+          << "\n result_type: " << dnn::DataType_Name(result_type)
+          << "\n block_size: " << block_size;
+
+  cudnn_frontend::graph::Graph graph;
+  auto compute_type = cudnn_frontend::DataType_t::FLOAT;
+  graph.set_compute_data_type(compute_type);
+  graph.set_intermediate_data_type(compute_type);
+
+  auto next_uid = [uid = 0]() mutable -> int { return CuDnnTensorUID(uid++); };
+  auto get_tensor_attr = [&](const dnn::TensorDescriptor& desc,
+                             bool is_rhs) -> absl::StatusOr<Tensor_attributes> {
+    TF_ASSIGN_OR_RETURN(std::vector<int64_t> dimensions,
+                        desc.GetPhysicalDimensionsMajorToMinor());
+    std::vector<int64_t> strides = desc.GetPhysicalStridesMajorToMinor();
+    if (dimensions.size() == 2) {
+      dimensions.insert(dimensions.begin(), 1);
+      strides.insert(strides.begin(), dimensions[1] * dimensions[2]);
+    }
+    CHECK_EQ(dimensions.size(), 3);
+    if (is_rhs) {
+      std::swap(dimensions[1], dimensions[2]);
+      std::swap(strides[1], strides[2]);
+    }
+    return Tensor_attributes()
+        .set_uid(next_uid())
+        .set_dim(dimensions)
+        .set_stride(strides)
+        .set_data_type(ToCudnnFrontendDataType(desc.type()));
+  };
+  TF_ASSIGN_OR_RETURN(auto a_data_attr, get_tensor_attr(lhs_data, false));
+  TF_ASSIGN_OR_RETURN(auto b_data_attr, get_tensor_attr(rhs_data, true));
+  TF_ASSIGN_OR_RETURN(auto a_scale_attr, get_tensor_attr(lhs_scale, false));
+  TF_ASSIGN_OR_RETURN(auto b_scale_attr, get_tensor_attr(rhs_scale, true));
+
+  a_scale_attr.set_reordering_type(
+      cudnn_frontend::TensorReordering_t::F8_128x4);
+  b_scale_attr.set_reordering_type(
+      cudnn_frontend::TensorReordering_t::F8_128x4);
+
+  auto a_data = graph.tensor(a_data_attr.set_name("a_data"));
+  auto b_data = graph.tensor(b_data_attr.set_name("b_data"));
+  auto a_scale = graph.tensor(a_scale_attr.set_name("a_scale"));
+  auto b_scale = graph.tensor(b_scale_attr.set_name("b_scale"));
+
+  auto dq_attr = Block_scale_dequantize_attributes().set_block_size(block_size);
+  auto a_dq = graph.block_scale_dequantize(a_data, a_scale, dq_attr);
+  auto b_dq = graph.block_scale_dequantize(b_data, b_scale, dq_attr);
+
+  auto matmul_attr = Matmul_attributes().set_compute_data_type(compute_type);
+  auto d_tensor = graph.matmul(a_dq, b_dq, matmul_attr);
+  d_tensor->set_uid(next_uid());
+  d_tensor->set_data_type(ToCudnnFrontendDataType(result_type));
+  d_tensor->set_is_virtual(false);
+
+  CudnnGraph cudnnGraph(std::move(graph));
+  TF_RETURN_IF_ERROR(cudnnGraph.Prepare(
+      dnn_support, NumericOptions{/*require_determinism=*/false,
+                                  /*allow_tf32=*/true}));
+  TF_RETURN_IF_ERROR(cudnnGraph.Build(dnn_support, /*plan_id=*/std::nullopt));
+
+  VLOG(4) << "\b workspace size:" << cudnnGraph.Graph().get_workspace_size();
+  VLOG(4) << "\b block scaled dot graph: " << cudnnGraph.Graph();
+
+  return cudnnGraph;
+#else
+  return absl::UnimplementedError(
+      "Cudnn block scaled dot only supported with Cudnn >= 9.7.0");
 #endif
 }
 
@@ -5485,20 +5642,21 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardOperationGraph(
     const dnn::TensorDescriptor& dq_desc, const dnn::TensorDescriptor& dk_desc,
     const dnn::TensorDescriptor& dv_desc,
     const std::optional<dnn::TensorDescriptor> bias_descriptor,
+    const std::optional<dnn::TensorDescriptor> dbias_descriptor,
     std::optional<double> dropout_rate, std::optional<int64_t> seed,
     double scale, bool use_dropout, bool use_bias, dnn::FMHAMaskKind mask_type,
-    bool force_deterministic, const int sliding_window_length) {
+    bool force_deterministic, const int sliding_window_length,
+    const int max_seg_per_batch) {
 #if CUDNN_VERSION >= 90000
-  if (VLOG_IS_ON(4)) {
-    VLOG(4) << "\n bmm1_grad_gemm1_rhs(q): " << q_desc.ToString()
-            << "\n bmm1_grad_gemm2_rhs(k): " << k_desc.ToString()
-            << "\n bmm2_grad_gemm1_lhs(p): " << p_desc.ToString()
-            << "\n bmm2_grad_gemm2_rhs(v^t): " << v_desc.ToString()
-            << "\n d_output(do): " << do_desc.ToString()
-            << "\n d_bmm1_lhs(dq): " << dq_desc.ToString()
-            << "\n d_bmm1_rhs(dk): " << dk_desc.ToString()
-            << "\n d_bmm2_rhs(dv): " << dv_desc.ToString();
-  }
+  VLOG(4) << "\n bmm1_grad_gemm1_rhs(q): " << q_desc.ToString()
+          << "\n bmm1_grad_gemm2_rhs(k): " << k_desc.ToString()
+          << "\n bmm2_grad_gemm1_lhs(p): " << p_desc.ToString()
+          << "\n bmm2_grad_gemm2_rhs(v^t): " << v_desc.ToString()
+          << "\n d_output(do): " << do_desc.ToString()
+          << "\n d_bmm1_lhs(dq): " << dq_desc.ToString()
+          << "\n d_bmm1_rhs(dk): " << dk_desc.ToString()
+          << "\n d_bmm2_rhs(dv): " << dv_desc.ToString();
+
   using cudnn_frontend::graph::Tensor_attributes;
   cudnn_frontend::graph::Graph graph;
   if (!(q_desc.type() == k_desc.type() && k_desc.type() == p_desc.type() &&
@@ -5513,19 +5671,38 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardOperationGraph(
       .set_intermediate_data_type(cudnn_frontend::DataType_t::FLOAT)
       .set_io_data_type(ioDataType);
 
-  auto p_dims = p_desc.GetCudnnCompatibleDimensions(false);
-  auto p_strides = p_desc.GetCudnnCompatibleStrides(false);
-  std::vector<int64_t> p_reduction_dims(p_dims.begin(), p_dims.end() - 1);
-  p_reduction_dims.push_back(1);
-
+  // Get dims and strides
+  std::vector<int64_t> q_dims = q_desc.GetCudnnCompatibleDimensions(false);
+  std::vector<int64_t> k_dims = k_desc.GetCudnnCompatibleDimensions(false);
+  std::vector<int64_t> v_dims = v_desc.GetCudnnCompatibleDimensions(true);
+  std::vector<int64_t> p_dims = p_desc.GetCudnnCompatibleDimensions(false);
+  std::vector<int64_t> p_strides = p_desc.GetCudnnCompatibleStrides(false);
+  std::vector<int64_t> do_dims = do_desc.GetCudnnCompatibleDimensions(false);
+  std::vector<int64_t> dq_dims = dq_desc.dimensions();
+  std::vector<int64_t> dk_dims = dk_desc.dimensions();
+  std::vector<int64_t> dv_dims = dv_desc.dimensions();
+  std::vector<int64_t> stats_dims(p_dims.begin(), p_dims.end() - 1);
+  stats_dims.push_back(1);
   // Divide every stride by the last dim value.
-  std::vector<int64_t> p_reduction_strides;
-  p_reduction_strides.reserve(p_strides.size());
+  std::vector<int64_t> stats_strides;
+  stats_strides.reserve(p_strides.size());
   int64_t p_reduced_dim_len = p_dims.back();
   for (auto stride : p_strides) {
-    p_reduction_strides.push_back(stride / p_reduced_dim_len);
+    stats_strides.push_back(stride / p_reduced_dim_len);
   }
-  p_reduction_strides[3] = 1;
+  stats_strides[3] = 1;
+
+  if (max_seg_per_batch > 1) {
+    FixDimsForRaggedOffset(q_dims, max_seg_per_batch);
+    FixDimsForRaggedOffset(k_dims, max_seg_per_batch);
+    FixDimsForRaggedOffset(v_dims, max_seg_per_batch);
+    FixDimsForRaggedOffset(p_dims, max_seg_per_batch);
+    FixDimsForRaggedOffset(do_dims, max_seg_per_batch);
+    FixDimsForRaggedOffset(dq_dims, max_seg_per_batch);
+    FixDimsForRaggedOffset(dk_dims, max_seg_per_batch);
+    FixDimsForRaggedOffset(dv_dims, max_seg_per_batch);
+    FixDimsForRaggedOffset(stats_dims, max_seg_per_batch);
+  }
   bool is_causal = mask_type == dnn::FMHAMaskKind::CAUSAL ||
                    mask_type == dnn::FMHAMaskKind::PADDING_CAUSAL;
   auto sdpa_backward_options =
@@ -5540,70 +5717,70 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardOperationGraph(
   std::shared_ptr<Tensor_attributes> q =
       graph.tensor(Tensor_attributes()
                        .set_name("Q")
-                       .set_dim(q_desc.GetCudnnCompatibleDimensions(false))
+                       .set_dim(q_dims)
                        .set_stride(q_desc.GetCudnnCompatibleStrides(false))
                        .set_uid(next_uid())
                        .set_data_type(ioDataType));
   std::shared_ptr<Tensor_attributes> k =
       graph.tensor(Tensor_attributes()
                        .set_name("K")
-                       .set_dim(k_desc.GetCudnnCompatibleDimensions(false))
+                       .set_dim(k_dims)
                        .set_stride(k_desc.GetCudnnCompatibleStrides(false))
                        .set_uid(next_uid())
                        .set_data_type(ioDataType));
   std::shared_ptr<Tensor_attributes> v =
       graph.tensor(Tensor_attributes()
                        .set_name("V")
-                       .set_dim(v_desc.GetCudnnCompatibleDimensions(true))
+                       .set_dim(v_dims)
                        .set_stride(v_desc.GetCudnnCompatibleStrides(true))
                        .set_uid(next_uid())
                        .set_data_type(ioDataType));
   std::shared_ptr<Tensor_attributes> stats =
       graph.tensor(Tensor_attributes()
                        .set_name("stats")
-                       .set_dim(p_reduction_dims)
-                       .set_stride(p_reduction_strides)
+                       .set_dim(stats_dims)
+                       .set_stride(stats_strides)
                        .set_uid(next_uid())
                        .set_data_type(cudnn_frontend::DataType_t::FLOAT));
   std::shared_ptr<Tensor_attributes> dO =
       graph.tensor(Tensor_attributes()
                        .set_name("dO")
-                       .set_dim(do_desc.GetCudnnCompatibleDimensions(false))
+                       .set_dim(do_dims)
                        .set_stride(do_desc.GetCudnnCompatibleStrides(false))
                        .set_uid(next_uid())
                        .set_data_type(ioDataType));
   std::shared_ptr<Tensor_attributes> d_bias_tensor;
   if (use_bias) {
     DCHECK(bias_descriptor != std::nullopt);
-    auto bias_dim = bias_descriptor->dimensions();
-    auto q_dim = q_desc.GetCudnnCompatibleDimensions(false);
-    auto b = bias_dim[0];
-    auto n = bias_dim[1];
-    auto q_n = q_dim[1];
-    auto bias_tensor =
-        graph.tensor(Tensor_attributes()
-                         .set_name("bias")
-                         .set_dim(bias_descriptor->dimensions())
-                         .set_stride(bias_descriptor->GetLogicalStrides())
-                         .set_uid(next_uid()));
+    auto bias_dims = bias_descriptor->dimensions();
+    auto bias_strides = bias_descriptor->GetLogicalStrides();
+    auto b = bias_dims[0];
+    auto n = bias_dims[1];
+    auto q_n = q_dims[1];
+    auto bias_tensor = graph.tensor(Tensor_attributes()
+                                        .set_name("bias")
+                                        .set_dim(bias_dims)
+                                        .set_stride(bias_strides)
+                                        .set_uid(next_uid()));
     sdpa_backward_options.set_bias(bias_tensor);
 
     // shapes [1, 1, s, s], [b, 1, s, s], [b, h, s, s] are not supported for
     // dbias calculation but they are supported for forward bias calculation
     // Set UID later: this is the last output tuple element.
-    if (b == 1 && n == q_n) {
+    if (dbias_descriptor != std::nullopt) {
+      DCHECK(b == 1 && n == q_n);
       d_bias_tensor =
           graph.tensor(Tensor_attributes()
                            .set_name("dBias")
-                           .set_dim(bias_descriptor->dimensions())
-                           .set_stride(bias_descriptor->GetLogicalStrides()));
+                           .set_dim(dbias_descriptor->dimensions())
+                           .set_stride(dbias_descriptor->GetLogicalStrides()));
       sdpa_backward_options.set_dbias(d_bias_tensor);
     }
   }
   std::shared_ptr<Tensor_attributes> o =
       graph.tensor(Tensor_attributes()
                        .set_name("O")
-                       .set_dim(do_desc.GetCudnnCompatibleDimensions(false))
+                       .set_dim(do_dims)
                        .set_stride(do_desc.GetCudnnCompatibleStrides(false))
                        .set_uid(next_uid())
                        .set_data_type(ioDataType));
@@ -5611,9 +5788,10 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardOperationGraph(
   // Setting actual seqlen
   bool is_padding = mask_type == dnn::FMHAMaskKind::PADDING ||
                     mask_type == dnn::FMHAMaskKind::PADDING_CAUSAL;
-  if (is_padding) {
-    auto q_dim = q_desc.GetCudnnCompatibleDimensions(false);
-    auto b = q_dim[0];
+
+  if (is_padding || max_seg_per_batch > 1) {
+    // Get batch size
+    auto b = q_dims[0];
     auto seq_q_tensor =
         graph.tensor(Tensor_attributes()
                          .set_name("seq_q")
@@ -5631,6 +5809,31 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardOperationGraph(
     sdpa_backward_options.set_padding_mask(true);
     sdpa_backward_options.set_seq_len_q(seq_q_tensor);
     sdpa_backward_options.set_seq_len_kv(seq_kv_tensor);
+  }
+
+  std::shared_ptr<Tensor_attributes> offset_q, offset_kv;
+  if (max_seg_per_batch > 1) {
+    // Get batch size
+    auto b = q_dims[0];
+    offset_q =
+        graph.tensor(Tensor_attributes()
+                         .set_name("offset_q")
+                         .set_dim({b + 1, 1, 1, 1})
+                         .set_stride({1, 1, 1, 1})
+                         .set_uid(next_uid())
+                         .set_data_type(cudnn_frontend::DataType_t::INT32));
+    offset_kv =
+        graph.tensor(Tensor_attributes()
+                         .set_name("offset_k")
+                         .set_dim({b + 1, 1, 1, 1})
+                         .set_stride({1, 1, 1, 1})
+                         .set_uid(next_uid())
+                         .set_data_type(cudnn_frontend::DataType_t::INT32));
+    q->set_ragged_offset(offset_q);
+    k->set_ragged_offset(offset_kv);
+    v->set_ragged_offset(offset_kv);
+    o->set_ragged_offset(offset_q);
+    dO->set_ragged_offset(offset_q);
   }
   // Setting seed and offset
   std::shared_ptr<Tensor_attributes> seed_tensor;
@@ -5667,20 +5870,25 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardOperationGraph(
   auto [dQ, dK, dV] =
       graph.sdpa_backward(q, k, v, o, dO, stats, sdpa_backward_options);
 
+  if (max_seg_per_batch > 1) {
+    dQ->set_ragged_offset(offset_q);
+    dK->set_ragged_offset(offset_kv);
+    dV->set_ragged_offset(offset_kv);
+  }
   dQ->set_output(true)
-      .set_dim(dq_desc.dimensions())
+      .set_dim(dq_dims)
       .set_stride(dq_desc.GetLogicalStrides())
       .set_uid(next_uid())
       .set_name("dQ")
       .set_data_type(ioDataType);
   dK->set_output(true)
-      .set_dim(dk_desc.dimensions())
+      .set_dim(dk_dims)
       .set_stride(dk_desc.GetLogicalStrides())
       .set_uid(next_uid())
       .set_name("dK")
       .set_data_type(ioDataType);
   dV->set_output(true)
-      .set_dim(dv_desc.dimensions())
+      .set_dim(dv_dims)
       .set_stride(dv_desc.GetLogicalStrides())
       .set_uid(next_uid())
       .set_name("dV")
@@ -5701,9 +5909,8 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardOperationGraph(
                                                      /*allow_tf32=*/true}));
   TF_RETURN_IF_ERROR(cudnnGraph.Build(dnn_support, /*plan_id=*/std::nullopt));
 
-  if (VLOG_IS_ON(4)) {
-    VLOG(4) << "\b flash attention operation backward graph: " << graph;
-  }
+  VLOG(4) << "\b flash attention operation backward graph: "
+          << cudnnGraph.Graph();
 
   return cudnnGraph;
 #else
@@ -7233,9 +7440,11 @@ CudnnSupport::NormRunnerFromDesc(
   std::vector<int64_t> uids;
   auto next_uid = [&uids]() -> int64_t {
     if (uids.empty()) {
-      return uids.emplace_back(0);
+      uids.push_back(0);
+    } else {
+      uids.push_back(uids.back() + 1);
     }
-    return uids.emplace_back(uids.back() + 1);
+    return uids.back();
   };
 
   auto create_cudnn_tensor = [next_uid](dnn::TensorDescriptor tensor_descriptor)
@@ -8399,11 +8608,11 @@ bool CudnnSupport::DeriveOutputBatchDescriptor(
 #if CUDNN_VERSION >= 8100
 
 absl::StatusOr<std::unique_ptr<dnn::DnnGraph>> CudnnSupport::DeserializeGraph(
-    absl::string_view serialized_data) const {
-  TF_ASSIGN_OR_RETURN(auto cudnn, cudnn_->GetLocalHandle());
+    Stream& stream, absl::string_view serialized_data) const {
+  auto cudnn = cudnn_->GetHandle(stream.parent(), &stream);
   cudnn_frontend::graph::Graph graph;
   RETURN_IF_CUDNN_FRONTEND_ERROR(graph.deserialize(
-      cudnn->handle(),
+      cudnn.handle(),
       std::vector<uint8_t>(serialized_data.data(),
                            serialized_data.data() + serialized_data.size())));
   return std::make_unique<CudnnGraph>(std::move(graph));
@@ -8421,8 +8630,7 @@ absl::Status CudnnGraph::Prepare(dnn::DnnSupport& dnn_support,
   }
   RETURN_IF_CUDNN_FRONTEND_ERROR(
       graph_.create_execution_plans({cudnn_frontend::HeurMode_t::A}));
-  RETURN_IF_CUDNN_FRONTEND_ERROR(graph_.check_support(cudnn->handle()));
-  return absl::OkStatus();
+  RETURN_CUDNN_FRONTEND_STATUS(graph_.check_support(cudnn->handle()));
 }
 
 absl::Status CudnnGraph::Build(dnn::DnnSupport& dnn_support,
@@ -8430,12 +8638,10 @@ absl::Status CudnnGraph::Build(dnn::DnnSupport& dnn_support,
   const CudnnSupport& cudnn_support = static_cast<CudnnSupport&>(dnn_support);
   TF_ASSIGN_OR_RETURN(auto cudnn, cudnn_support.cudnn_->GetLocalHandle());
   if (plan_id.has_value()) {
-    RETURN_IF_CUDNN_FRONTEND_ERROR(
+    RETURN_CUDNN_FRONTEND_STATUS(
         graph_.build_plan_at_index(cudnn->handle(), *plan_id));
-  } else {
-    RETURN_IF_CUDNN_FRONTEND_ERROR(graph_.build_plans(cudnn->handle()));
   }
-  return absl::OkStatus();
+  RETURN_CUDNN_FRONTEND_STATUS(graph_.build_plans(cudnn->handle()));
 }
 
 absl::Status CudnnGraph::Execute(Stream& stream,
@@ -8471,10 +8677,9 @@ absl::Status CudnnGraph::Execute(Stream& stream,
 
   const CudnnSupport& dnn_support =
       static_cast<CudnnSupport&>(*stream.parent()->AsDnn());
-  RETURN_IF_CUDNN_FRONTEND_ERROR(graph_.execute(
-      dnn_support.cudnn_->GetHandle(stream.parent(), &stream).handle(),
-      tensor_to_ptr_map, workspace.opaque()));
-  return absl::OkStatus();
+  auto cudnn = dnn_support.cudnn_->GetHandle(stream.parent(), &stream);
+  RETURN_CUDNN_FRONTEND_STATUS(
+      graph_.execute(cudnn.handle(), tensor_to_ptr_map, workspace.opaque()));
 }
 
 #endif  // CUDNN_VERSION >= 8100
@@ -8495,7 +8700,7 @@ void initialize_cudnn() {
           });
 
   if (!status.ok()) {
-    LOG(ERROR) << "Unable to register cuDNN factory: " << status.message();
+    LOG(INFO) << "Unable to register cuDNN factory: " << status.message();
   }
 }
 

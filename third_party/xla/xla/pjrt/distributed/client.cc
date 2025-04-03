@@ -19,7 +19,6 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -27,6 +26,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
@@ -53,17 +53,20 @@ class DistributedRuntimeCoordinationServiceClient
   absl::Status Connect() override;
   absl::Status Shutdown() override;
   absl::StatusOr<std::string> BlockingKeyValueGet(
-      std::string_view key, absl::Duration timeout) override;
+      absl::string_view key, absl::Duration timeout) override;
+  absl::StatusOr<std::string> KeyValueTryGet(absl::string_view key) override;
   absl::StatusOr<std::vector<std::pair<std::string, std::string>>>
-  KeyValueDirGet(std::string_view key) override;
-  absl::Status KeyValueSet(std::string_view key,
-                           std::string_view value) override;
-  absl::Status KeyValueSet(std::string_view key, std::string_view value,
+  KeyValueDirGet(absl::string_view key) override;
+  absl::Status KeyValueSet(absl::string_view key,
+                           absl::string_view value) override;
+  absl::Status KeyValueSet(absl::string_view key, absl::string_view value,
                            bool allow_overwrite) override;
-  absl::Status KeyValueDelete(std::string_view key) override;
+  absl::Status KeyValueDelete(absl::string_view key) override;
   absl::Status WaitAtBarrier(
       std::string barrier_id, absl::Duration timeout,
       std::optional<absl::Span<const int32_t>> process_ids) override;
+  absl::StatusOr<std::vector<int32_t>> GetLiveNodes(
+      absl::Span<const int32_t> nodes) override;
   absl::StatusOr<tsl::CoordinationServiceAgent*> GetCoordinationServiceAgent()
       override;
 
@@ -141,13 +144,19 @@ absl::Status DistributedRuntimeCoordinationServiceClient::Shutdown() {
 
 absl::StatusOr<std::string>
 DistributedRuntimeCoordinationServiceClient::BlockingKeyValueGet(
-    std::string_view key, absl::Duration timeout) {
+    absl::string_view key, absl::Duration timeout) {
   return coord_agent_->GetKeyValue(key, timeout);
+}
+
+absl::StatusOr<std::string>
+DistributedRuntimeCoordinationServiceClient::KeyValueTryGet(
+    absl::string_view key) {
+  return coord_agent_->TryGetKeyValue(key);
 }
 
 absl::StatusOr<std::vector<std::pair<std::string, std::string>>>
 DistributedRuntimeCoordinationServiceClient::KeyValueDirGet(
-    std::string_view key) {
+    absl::string_view key) {
   TF_ASSIGN_OR_RETURN(const auto results, coord_agent_->GetKeyValueDir(key));
 
   std::vector<std::pair<std::string, std::string>> kvs;
@@ -162,17 +171,17 @@ DistributedRuntimeCoordinationServiceClient::KeyValueDirGet(
 }
 
 absl::Status DistributedRuntimeCoordinationServiceClient::KeyValueDelete(
-    std::string_view key) {
+    absl::string_view key) {
   return coord_agent_->DeleteKeyValue(key);
 }
 
 absl::Status DistributedRuntimeCoordinationServiceClient::KeyValueSet(
-    std::string_view key, std::string_view value) {
+    absl::string_view key, absl::string_view value) {
   return KeyValueSet(key, value, /*allow_overwrite=*/false);
 }
 
 absl::Status DistributedRuntimeCoordinationServiceClient::KeyValueSet(
-    std::string_view key, std::string_view value, bool allow_overwrite) {
+    absl::string_view key, absl::string_view value, bool allow_overwrite) {
   return coord_agent_->InsertKeyValue(key, value, allow_overwrite);
 }
 
@@ -190,6 +199,36 @@ absl::Status DistributedRuntimeCoordinationServiceClient::WaitAtBarrier(
     }
   }
   return coord_agent_->WaitAtBarrier(barrier_id, timeout, tasks);
+}
+
+absl::StatusOr<std::vector<int32_t>>
+DistributedRuntimeCoordinationServiceClient::GetLiveNodes(
+    absl::Span<const int32_t> nodes) {
+  // Note that jax.distributed uses terms "process" and "node", and the
+  // coordination service uses the term "task". These all refer to the same
+  // thing, and it's why you see us use both sets of terms as we cross the
+  // abstraction boundary from jax.distributed into the coordination service.
+
+  // Wrap the node ids into tasks.
+  std::vector<tensorflow::CoordinatedTask> tasks;
+  tasks.reserve(nodes.size());
+  for (int32_t task_id : nodes) {
+    tensorflow::CoordinatedTask task;
+    task.set_job_name("jax_worker");
+    task.set_task_id(task_id);
+    tasks.push_back(std::move(task));
+  }
+
+  // Get the set of live tasks.
+  TF_ASSIGN_OR_RETURN(const std::vector<tensorflow::CoordinatedTask> live_tasks,
+                      coord_agent_->GetAliveTasks(tasks));
+
+  // Extract the node ids from the live tasks.
+  std::vector<int32_t> live_nodes(live_tasks.size());
+  for (int i = 0; i < live_tasks.size(); ++i) {
+    live_nodes[i] = live_tasks[i].task_id();
+  }
+  return live_nodes;
 }
 
 absl::StatusOr<tsl::CoordinationServiceAgent*>
@@ -212,12 +251,16 @@ class DistributedKeyValueStore : public KeyValueStoreInterface {
                            std::string prefix)
       : client_(std::move(client)), prefix_(std::move(prefix)) {}
 
-  absl::StatusOr<std::string> Get(std::string_view key,
+  absl::StatusOr<std::string> Get(absl::string_view key,
                                   absl::Duration timeout) override {
     return client_->BlockingKeyValueGet(absl::StrCat(prefix_, key), timeout);
   }
 
-  absl::Status Set(std::string_view key, std::string_view value) override {
+  absl::StatusOr<std::string> TryGet(absl::string_view key) override {
+    return client_->KeyValueTryGet(absl::StrCat(prefix_, key));
+  }
+
+  absl::Status Set(absl::string_view key, absl::string_view value) override {
     return client_->KeyValueSet(absl::StrCat(prefix_, key), value);
   }
 

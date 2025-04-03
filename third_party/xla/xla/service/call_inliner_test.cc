@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/service/call_inliner.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "absl/log/log.h"
@@ -23,16 +24,18 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/ir/hlo_print_options.h"
 #include "xla/hlo/parser/hlo_parser.h"
+#include "xla/hlo/testlib/filecheck.h"
 #include "xla/hlo/utils/hlo_matchers.h"
 #include "xla/literal_util.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/test.h"
 #include "xla/tests/hlo_test_base.h"
 #include "xla/tsl/lib/core/status_test_util.h"
+#include "xla/tsl/platform/status_matchers.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/statusor.h"
 
 namespace op = xla::testing::opcode_matchers;
 
@@ -405,6 +408,31 @@ TEST_F(CallInlinerTest, PreserveCompositeCall) {
   EXPECT_FALSE((*inst)->frontend_attributes().map().empty());
 }
 
+TEST_F(CallInlinerTest, DontInlineCallWithAttributeInlineableFalse) {
+  const char* const hloString = R"(
+    HloModule jit_f, entry_computation_layout={(f32[8,8]{1,0})->f32[8,8]{1,0}}
+    %test (Arg_0.5: f32[1,8]) -> f32[1,8] {
+      %Arg_0.5 = f32[1,8]{1,0} parameter(0)
+      ROOT %add.6 = f32[1,8]{1,0} add(f32[1,8]{1,0} %Arg_0.5, f32[1,8]{1,0} %Arg_0.5), metadata={source_file="-" source_line=11}
+    }
+    ENTRY %main.10 (Arg_0.1: f32[8,8]) -> f32[8,8] {
+      %Arg_0.1 = f32[8,8]{1,0} parameter(0)
+      %custom-call.3 = f32[1,8]{1,0} custom-call(f32[8,8]{1,0} %Arg_0.1), custom_call_target="SPMDFullToShardShape", sharding={manual}, metadata={source_file="-" source_line=4}
+      %call.7 = f32[1,8]{1,0} call(f32[1,8]{1,0} %custom-call.3), to_apply=%test, frontend_attributes={inlineable="false"}
+      ROOT %custom-call.9 = f32[8,8]{1,0} custom-call(f32[1,8]{1,0} %call.7), custom_call_target="SPMDShardToFullShape", sharding={devices=[8,1]<=[8]}, metadata={source_file="-" source_line=7}
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hloString));
+  module->mutable_config().set_use_shardy_partitioner(true);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, CallInliner().Run(module.get()))
+  // The single call in the module is not inlined.
+  EXPECT_FALSE(changed);
+
+  HloInstruction* call = FindInstruction(module.get(), xla::HloOpcode::kCall);
+  EXPECT_NE(call, nullptr);
+  EXPECT_TRUE(call->has_to_apply());
+  EXPECT_EQ(call->to_apply()->name(), "test");
+}
+
 TEST_F(CallInlinerTest, UseShardyMhloToHloShmapBodyNotInlined) {
   const char* const hloString = R"(
     HloModule jit_f, entry_computation_layout={(f32[8,8]{1,0})->f32[8,8]{1,0}}
@@ -464,13 +492,13 @@ TEST_F(CallInlinerTest, UseShardManualComputationBodyNotInlined) {
   EXPECT_EQ(call->to_apply()->name(), "xla.sdy.manual_computation_body.4");
 }
 
-// Inliner only checks if the name of the function has
-// "xla.sdy.manual_computation_body" a prefix, not if it contains it.
-TEST_F(CallInlinerTest, UseShardManualComputationBodyInlined) {
+// Make sure we check the name of the called function contains the string, not
+// just the prefix/suffix.
+TEST_F(CallInlinerTest, UseShardManualComputationBodySurroundedNotInlined) {
   const char* const hloString = R"(
     HloModule jit_f, entry_computation_layout={(f32[8,8]{1,0})->f32[8,8]{1,0}}
 
-    %prefix_xla.sdy.manual_computation_body.4 (Arg_0.5: f32[1,8]) -> f32[1,8] {
+    %my_model.___call__.fwd.xla.sdy.manual_computation_body_14.1234 (Arg_0.5: f32[1,8]) -> f32[1,8] {
       %Arg_0.5 = f32[1,8]{1,0} parameter(0)
       ROOT %add.6 = f32[1,8]{1,0} add(f32[1,8]{1,0} %Arg_0.5, f32[1,8]{1,0} %Arg_0.5), metadata={source_file="-" source_line=11}
     }
@@ -478,15 +506,99 @@ TEST_F(CallInlinerTest, UseShardManualComputationBodyInlined) {
     ENTRY %main.10 (Arg_0.1: f32[8,8]) -> f32[8,8] {
       %Arg_0.1 = f32[8,8]{1,0} parameter(0)
       %custom-call.3 = f32[1,8]{1,0} custom-call(f32[8,8]{1,0} %Arg_0.1), custom_call_target="SPMDFullToShardShape", sharding={manual}, metadata={source_file="-" source_line=4}
-      %call.7 = f32[1,8]{1,0} call(f32[1,8]{1,0} %custom-call.3), to_apply=%prefix_xla.sdy.manual_computation_body.4
+      %call.7 = f32[1,8]{1,0} call(f32[1,8]{1,0} %custom-call.3), to_apply=%my_model.___call__.fwd.xla.sdy.manual_computation_body_14.1234
       ROOT %custom-call.9 = f32[8,8]{1,0} custom-call(f32[1,8]{1,0} %call.7), custom_call_target="SPMDShardToFullShape", sharding={devices=[8,1]<=[8]}, metadata={source_file="-" source_line=7}
     })";
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hloString));
   module->mutable_config().set_use_shardy_partitioner(true);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, CallInliner().Run(module.get()));
-  VLOG(1) << module->ToString();
-  // Will be inlined.
-  EXPECT_TRUE(changed);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, CallInliner().Run(module.get()))
+  // The single call in the module is not inlined.
+  EXPECT_FALSE(changed);
+
+  HloInstruction* call = FindInstruction(module.get(), xla::HloOpcode::kCall);
+  EXPECT_NE(call, nullptr);
+  EXPECT_TRUE(call->has_to_apply());
+  EXPECT_EQ(call->to_apply()->name(),
+            "my_model.___call__.fwd.xla.sdy.manual_computation_body_14.1234");
+}
+
+TEST_F(CallInlinerTest, ControlDepsPropagateToRootOfInlinedInstructions) {
+  const char* hlo = R"(
+  HloModule test
+
+  bar {
+    p0 = s32[] parameter(0)
+    add = s32[] add(p0, s32[] constant(2))
+    ROOT res = s32[] subtract(add, s32[] constant(3))
+  }
+
+  ENTRY main {
+    p0 = s32[] parameter(0)
+    p1 = s32[] parameter(1)
+    p2 = s32[] parameter(2)
+    call1 = s32[] custom-call(p0), custom_call_target="foo"
+    call2 = s32[] call(p1), to_apply=bar, control-predecessors={call1}
+    call3 = s32[] custom-call(p2), custom_call_target="baz", control-predecessors={call2}
+    ROOT res = (s32[], s32[], s32[]) tuple(call1, call2, call3)
+  })";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                          ParseAndReturnVerifiedModule(hlo));
+  CallInliner call_inliner;
+  TF_ASSERT_OK_AND_ASSIGN(bool mutated, call_inliner.Run(m.get()));
+  EXPECT_TRUE(mutated);
+  TF_ASSERT_OK_AND_ASSIGN(
+      bool filecheck_result,
+      RunFileCheck(m->ToString(HloPrintOptions{}
+                                   .set_print_result_shape(false)
+                                   .set_print_operand_shape(false)),
+                   R"(
+  // CHECK: ENTRY %main
+  // CHECK-DAG: %[[call1:.+]] = custom-call({{.+}}), custom_call_target="foo"
+  // CHECK-DAG: %[[p1:.+]] = parameter(1)
+  // CHECK-DAG: %[[c2:.+]] = constant(2), control-predecessors={%[[call1]]}
+  // CHECK-DAG: %[[add:.+]] = add(%[[p1]], %[[c2]]), control-predecessors={%[[call1]]}
+  // CHECK-DAG: %[[c3:.+]] = constant(3), control-predecessors={%[[call1]]}
+  // CHECK-DAG: %[[res:.+]] = subtract(%[[add]], %[[c3]]), control-predecessors={%[[call1]]}
+  // CHECK-DAG: %[[call3:.+]] = custom-call({{.+}}), custom_call_target="baz", control-predecessors={%[[res]]}
+  )"));
+  EXPECT_TRUE(filecheck_result);
+}
+
+TEST_F(CallInlinerTest, ChannelIdsAreUniquifiedWhenSettingIsEnabled) {
+  const char* hlo = R"(
+ag {
+  input = f32[128,32] parameter(0)
+  ROOT ag = f32[128,128] all-gather(input),
+    replica_groups={}, dimensions={1}, channel_id=1337
+}
+
+ag2 {
+  input = f32[128,128] parameter(0)
+  ROOT ag = f32[128,128] all-gather(input),
+    replica_groups={}, dimensions={1}, channel_id=1337
+}
+
+ENTRY main {
+  input = f32[128,32] parameter(0)
+  ag = f32[128,128] call(input), to_apply=ag
+  ag2 = f32[128,128] call(ag), to_apply=ag2
+  ROOT result = (f32[128,128], f32[128,128]) tuple(ag2, ag)
+})";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                          ParseAndReturnVerifiedModule(hlo));
+  CallInliner call_inliner(
+      /*single_call_site=*/false, /*update_domain=*/false,
+      /*composites_to_preserve=*/{}, /*uniquify_channel_ids=*/true);
+  EXPECT_THAT(call_inliner.Run(m.get()), ::tsl::testing::IsOkAndHolds(true));
+
+  auto ag = m->entry_computation()->root_instruction()->operand(0);
+  auto ag2 = m->entry_computation()->root_instruction()->operand(1);
+
+  EXPECT_THAT(ag, op::AllGather());
+  EXPECT_THAT(ag2, op::AllGather());
+  EXPECT_NE(ag->channel_id(), ag2->channel_id());
 }
 
 }  // namespace

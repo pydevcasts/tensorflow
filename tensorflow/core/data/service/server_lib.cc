@@ -109,7 +109,7 @@ int GrpcDataServerBase::BoundPort() { return bound_port(); }
 
 void GrpcDataServerBase::AddProfilerServiceToBuilder(
     ::grpc::ServerBuilder& builder) {
-  profiler_service_ = profiler::CreateProfilerService();
+  profiler_service_ = tsl::profiler::CreateProfilerService();
   builder.RegisterService(profiler_service_.get());
 }
 
@@ -229,6 +229,10 @@ void WorkerGrpcDataServer::MaybeStartAlternativeDataTransferServer(
     return;
   }
   alternative_transfer_server.set_compatibility_info(*compatibility_info);
+  alternative_transfer_server.set_fall_back_to_grpc_at_client_creation_time(
+      transfer_server_->FallBackToGrpcAtClientCreationTime());
+  alternative_transfer_server.set_fall_back_to_grpc_at_get_element_time(
+      transfer_server_->FallBackToGrpcAtGetElementTime());
   transfer_servers.push_back(alternative_transfer_server);
 }
 

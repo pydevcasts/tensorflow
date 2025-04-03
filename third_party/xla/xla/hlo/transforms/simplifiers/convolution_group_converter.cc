@@ -15,10 +15,15 @@ limitations under the License.
 
 #include "xla/hlo/transforms/simplifiers/convolution_group_converter.h"
 
-#include <algorithm>
+#include <cstdint>
+#include <functional>
 #include <memory>
+#include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -495,12 +500,12 @@ absl::Status ConvolutionVisitor::HandleConvolution(
     // Add a spatial dimension to emulate a larger output feature dimension
     // to avoid creating a convolution with group_count = 1.
     std::vector<int64_t> new_filter_dimension;
-    new_filter_dimension.reserve(filter->shape().rank() + 1);
+    new_filter_dimension.reserve(filter->shape().dimensions_size() + 1);
     const int64_t depthwise_multiplier =
         filter->shape().dimensions(kernel_output_feature_dim) / group_count;
     // Split the kernel output feature dimension into group count and
     // depthwise mutilipler.
-    for (int64_t i = 0; i < filter->shape().rank(); ++i) {
+    for (int64_t i = 0; i < filter->shape().dimensions_size(); ++i) {
       if (i == kernel_output_feature_dim) {
         new_filter_dimension.push_back(group_count);
         new_filter_dimension.push_back(depthwise_multiplier);
@@ -525,7 +530,8 @@ absl::Status ConvolutionVisitor::HandleConvolution(
             filter));
 
     auto new_activation_shape = convolution->operand(0)->shape();
-    dim_numbers.add_input_spatial_dimensions(new_activation_shape.rank());
+    dim_numbers.add_input_spatial_dimensions(
+        new_activation_shape.dimensions_size());
 
     // Create and activations spatial dimension of size 1 with a reversed
     // window and high and low padding equal to the depthwise_multiplier -1.
@@ -548,8 +554,8 @@ absl::Status ConvolutionVisitor::HandleConvolution(
     // Split the output feature dimension into and output feature of group
     // count and depthwise multipler as an output spatial dimension.
     std::vector<int64_t> new_output_dimension;
-    new_output_dimension.reserve(convolution->shape().rank() + 1);
-    for (int64_t i = 0; i < convolution->shape().rank(); ++i) {
+    new_output_dimension.reserve(convolution->shape().dimensions_size() + 1);
+    for (int64_t i = 0; i < convolution->shape().dimensions_size(); ++i) {
       if (i == dim_numbers.output_feature_dimension()) {
         new_output_dimension.push_back(group_count);
         new_output_dimension.push_back(depthwise_multiplier);

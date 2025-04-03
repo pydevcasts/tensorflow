@@ -18,26 +18,27 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
-#include "absl/base/thread_annotations.h"
+#include "absl/base/call_once.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/synchronization/mutex.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "xla/backends/cpu/runtime/kernel.h"
+#include "xla/backends/cpu/runtime/kernel_c_api.h"
 #include "xla/backends/cpu/runtime/thunk.h"
+#include "xla/codegen/kernel_spec.h"
 #include "xla/service/buffer_assignment.h"
-#include "xla/stream_executor/host/host_kernel.h"
-#include "xla/stream_executor/host/host_kernel_c_api.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 
@@ -45,6 +46,26 @@ namespace xla::cpu {
 
 // Forward declare thunk defined below.
 class KernelThunk;
+
+// Base class for kernel thunks required for serialization.
+// A base class is needed so that we can serialize KernelThunk and
+// SmallKernelThunk via the same interface.
+class KernelThunkBase : public Thunk {
+ public:
+  virtual ~KernelThunkBase() = default;  // NOLINT: clang-tidy complains that
+                                         // `override` should be used here.
+  KernelThunkBase(Kind kind, Info info) : Thunk(kind, std::move(info)) {}
+  virtual absl::string_view kernel_name() const = 0;
+  virtual const se::ThreadDim& thread_dim() const = 0;
+  virtual const std::optional<uint64_t>& min_alignment() const = 0;
+
+  virtual absl::Span<const BufferAllocation::Slice> arguments_buffers()
+      const = 0;
+
+  virtual absl::Span<const BufferAllocation::Slice> results_buffers() const = 0;
+
+  virtual const absl::flat_hash_set<int64_t>& invariant_arguments() const = 0;
+};
 
 namespace internal {
 
@@ -58,9 +79,27 @@ inline constexpr int64_t kDynamicKernelParameter = -1;
 // overheads for the smallest HLO modules.
 template <int64_t num_arguments = kDynamicKernelParameter,
           int64_t num_results = kDynamicKernelParameter>
-class KernelThunk : public Thunk {
+class KernelThunk : public KernelThunkBase {
  public:
   BufferUses buffer_uses() const final;
+
+  absl::string_view kernel_name() const final { return kernel_name_; }
+  const se::ThreadDim& thread_dim() const final { return thread_dim_; }
+  const std::optional<uint64_t>& min_alignment() const final {
+    return min_alignment_;
+  }
+
+  absl::Span<const BufferAllocation::Slice> arguments_buffers() const final {
+    return absl::MakeSpan(arguments_buffers_);
+  }
+
+  absl::Span<const BufferAllocation::Slice> results_buffers() const final {
+    return absl::MakeSpan(results_buffers_);
+  }
+
+  const absl::flat_hash_set<int64_t>& invariant_arguments() const final {
+    return invariant_arguments_;
+  }
 
  protected:
   tsl::AsyncValueRef<ExecuteEvent> ExecuteInternal(const ExecuteParams& params);
@@ -90,8 +129,8 @@ class KernelThunk : public Thunk {
 
   using KernelArgs = std::conditional_t<
       IsDynamic(num_arguments) || IsDynamic(num_results),
-      absl::InlinedVector<SE_HOST_KernelArg, 8>,
-      std::array<SE_HOST_KernelArg, Size(num_arguments + num_results)>>;
+      absl::InlinedVector<XLA_CPU_KernelArg, 8>,
+      std::array<XLA_CPU_KernelArg, Size(num_arguments + num_results)>>;
 
   KernelThunk(Info info,
               absl::Span<const BufferAllocation::Slice> arguments_buffers,
@@ -120,13 +159,13 @@ class KernelThunk : public Thunk {
   bool call_once_;
 
   // Lazily loaded host kernel corresponding to `kernel_name_`.
-  absl::Mutex mutex_;
-  std::optional<se::host::HostKernel> kernel_ ABSL_GUARDED_BY(mutex_);
-  std::atomic<se::host::HostKernel*> kernel_ptr_;  // pointer to `kernel_`
+  absl::once_flag kernel_init_flag_;
+  absl::StatusOr<Kernel> kernel_;
 
   // Pre-initialized kernel arguments that are updated with memory addresses
-  // before the kernel launch.
-  KernelArgs kernel_args_;
+  // before the kernel launch. Align `KernelArgs` to 64 bytes to allow aligned
+  // moves on a hot path.
+  alignas(64) KernelArgs kernel_args_;
 };
 
 }  // namespace internal
@@ -159,6 +198,10 @@ class KernelThunk final : public internal::KernelThunk<> {
       std::string kernel_name, se::ThreadDim thread_dim,
       absl::flat_hash_set<int64_t> invariant_arguments,
       std::optional<uint64_t> min_alignment = std::nullopt);
+
+  static absl::StatusOr<std::unique_ptr<Thunk>> Create(
+      Thunk::Info info, const KernelSpec& kernel_spec,
+      std::optional<uint64_t> min_alignment);
 
   tsl::AsyncValueRef<Thunk::ExecuteEvent> Execute(
       const Thunk::ExecuteParams& params) final;

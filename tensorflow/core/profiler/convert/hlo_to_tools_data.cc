@@ -18,20 +18,20 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <utility>
-#include <vector>
 
+#include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/string_view.h"
 #include "xla/service/hlo.pb.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tensorflow/core/platform/errors.h"
-#include "tensorflow/core/platform/logging.h"
-#include "tensorflow/core/platform/protobuf.h"
-#include "tensorflow/core/platform/statusor.h"
 #include "tensorflow/core/profiler/convert/hlo_proto_to_graph_view.h"
 #include "tensorflow/core/profiler/convert/hlo_proto_to_memory_visualization_utils.h"
 #include "tensorflow/core/profiler/convert/repository.h"
 #include "tensorflow/core/profiler/convert/tool_options.h"
 #include "tensorflow/core/profiler/convert/xplane_to_hlo.h"
 #include "tensorflow/core/profiler/protobuf/memory_viewer_preprocess.pb.h"
+#include "tsl/platform/protobuf.h"
 
 namespace tensorflow {
 namespace profiler {
@@ -39,12 +39,11 @@ namespace profiler {
 namespace {
 
 absl::StatusOr<PreprocessResult> GetMemoryViewerPreprocessResult(
-    const xla::HloProto& hlo_proto) {
+    const xla::HloProto& hlo_proto, int memory_space_color) {
   static constexpr int kSmallBufferSize = 16 * 1024;  // 16KB
-  static constexpr int kMemorySpaceColor = 0;         // HBM
 
   auto result_or = ConvertHloProtoToPreprocessResult(
-      hlo_proto, kSmallBufferSize, kMemorySpaceColor);
+      hlo_proto, kSmallBufferSize, memory_space_color);
   if (!result_or.ok()) {
     return errors::Internal(
         "Failed to convert HLO proto to memory viewer result: ",
@@ -54,16 +53,17 @@ absl::StatusOr<PreprocessResult> GetMemoryViewerPreprocessResult(
 }
 
 absl::StatusOr<std::string> ConvertHloProtoToMemoryViewer(
-    const xla::HloProto& hlo_proto) {
-  auto result_or = GetMemoryViewerPreprocessResult(hlo_proto);
+    const xla::HloProto& hlo_proto, int memory_space_color) {
+  auto result_or =
+      GetMemoryViewerPreprocessResult(hlo_proto, memory_space_color);
   if (!result_or.ok()) {
     return result_or.status();
   }
 
   std::string json_output;
-  tensorflow::protobuf::util::JsonPrintOptions options;
+  tsl::protobuf::util::JsonPrintOptions options;
   options.always_print_primitive_fields = true;
-  auto encoded_status = tensorflow::protobuf::util::MessageToJsonString(
+  auto encoded_status = tsl::protobuf::util::MessageToJsonString(
       result_or.value(), &json_output, options);
   if (!encoded_status.ok()) {
     const auto& error_message = encoded_status.message();
@@ -76,8 +76,9 @@ absl::StatusOr<std::string> ConvertHloProtoToMemoryViewer(
 }
 
 absl::StatusOr<std::string> ConvertHloProtoToAllocationTimeline(
-    const xla::HloProto& hlo_proto) {
-  auto result_or = GetMemoryViewerPreprocessResult(hlo_proto);
+    const xla::HloProto& hlo_proto, int memory_space_color) {
+  auto result_or =
+      GetMemoryViewerPreprocessResult(hlo_proto, memory_space_color);
   if (!result_or.ok()) {
     return result_or.status();
   }
@@ -118,11 +119,18 @@ absl::StatusOr<std::string> ConvertHloProtoToToolData(
       GetHloProtoByModuleName(session_snapshot, *hlo_module_name));
 
   // Convert from HLO proto to tools data.
+  int memory_space_color = 0;
+  if (!absl::SimpleAtoi(
+          GetParamWithDefault(options, "memory_space", std::string("0")),
+          &memory_space_color)) {
+    memory_space_color = 0;
+  }
+
   if (tool_name == "memory_viewer") {
     if (GetParamWithDefault(options, "view_memory_allocation_timeline", 0)) {
-      return ConvertHloProtoToAllocationTimeline(hlo_proto);
+      return ConvertHloProtoToAllocationTimeline(hlo_proto, memory_space_color);
     }
-    return ConvertHloProtoToMemoryViewer(hlo_proto);
+    return ConvertHloProtoToMemoryViewer(hlo_proto, memory_space_color);
   } else if (tool_name == "graph_viewer") {
     return ConvertHloProtoToGraphViewer(hlo_proto, options);
   } else {

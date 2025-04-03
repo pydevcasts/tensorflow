@@ -404,8 +404,7 @@ Service::ExecuteParallelAndRegisterResult(
       // Asynchronously launch the computation.
       TF_ASSIGN_OR_RETURN(ScopedShapedBuffer result,
                           executables[i]->ExecuteAsyncOnStream(
-                              &run_options, arguments[i][replica],
-                              /*hlo_execution_profile=*/nullptr));
+                              &run_options, arguments[i][replica]));
 
       result_buffers.push_back(std::move(result));
     }
@@ -1085,7 +1084,7 @@ absl::StatusOr<Literal> Service::ComputeConstantGraph(
          absl::Span<const Literal*> operands) -> absl::StatusOr<Literal> {
         if (custom_call->custom_call_target() == "SliceToDynamic") {
           auto result = operands[0]->Clone();
-          for (int64_t i = 0; i < result.shape().rank(); ++i) {
+          for (int64_t i = 0; i < result.shape().dimensions_size(); ++i) {
             result.SetDynamicSize(i, operands[1 + i]->Get<int32_t>({}));
           }
           return result.ToStatic();

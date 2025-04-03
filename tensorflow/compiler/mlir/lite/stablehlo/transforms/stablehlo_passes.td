@@ -161,10 +161,28 @@ def LiftCallSiteLocCallerPass : Pass<"lift-callsite-loc-caller", "ModuleOp"> {
   let dependentDialects = ["func::FuncDialect"];
 }
 
+def LegalizeQDQCustomCallPass : Pass<"legalize-qdq-custom-call", "ModuleOp"> {
+  let summary = "Legalize stablehlo.custom_call for QDQ ops from odml-torch.";
+  let description = [{
+    Legalize stablehlo.custom_call for Q/DQ ops from odml-torch. Quant dialect
+    is not registered in Python, so odml-torch uses custom_call to as carriers.
+  }];
+  let dependentDialects = ["func::FuncDialect", "quant::QuantDialect", "stablehlo::StablehloDialect"];
+}
+
 def BuildStableHLOCompositePass : Pass<"build-stablehlo-composite", "ModuleOp"> {
   let summary = "Build stablehlo.composite from inlined stablehlo.custom_call mark_tensor ops.";
   let description = [{
     Build stablehlo.composite from inlined stablehlo.custom_call mark_tensor ops.
   }];
   let dependentDialects = ["func::FuncDialect", "stablehlo::StablehloDialect"];
+}
+
+def StablehloUnfuseBatchNormPass : Pass<"stablehlo-unfuse-batch-norm", "mlir::func::FuncOp"> {
+  let summary = "Unfuses stablehlo.batch_norm_(inference,training) ops into stablehlo arithmetic ops.";
+  let dependentDialects = ["stablehlo::StablehloDialect", "TF::TensorFlowDialect", "mlir::shape::ShapeDialect"];
+}
+
+def StablehloFuseConvolutionPass : Pass<"stablehlo-fuse-convolution", "mlir::func::FuncOp"> {
+  let summary = "Fuses stablehlo.convolution and binary element-wise ops.";
 }

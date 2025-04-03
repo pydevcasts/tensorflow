@@ -538,6 +538,11 @@ cc_library(
     hdrs = ["conv_ops_gpu.h"],
 )
 
+cc_library(
+    name = "pooling_ops_gpu_hdrs",
+    hdrs = ["maxpooling_op_gpu.h"],
+)
+
 # We keep this target only because some contrib/ targets depend on it. The
 # reason why the contrib/ targets can't depend on gpu_utils is that, some
 # of the targets are tf_custom_op_library. tf_custom_op_library forbids the
@@ -710,7 +715,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:optional",
-        "@local_tsl//tsl/platform:types",
+        "@local_xla//xla/tsl/platform:types",
     ],
     alwayslink = 1,
 )
@@ -971,12 +976,6 @@ tf_kernel_library(
     name = "bcast_ops",
     prefix = "bcast_ops",
     deps = ARRAY_DEPS,
-)
-
-tf_kernel_library(
-    name = "bitcast_op",
-    deprecation = "use //third_party/tensorflow/c/kernels:bitcast_op instead",
-    deps = ["//tensorflow/c/kernels:bitcast_op"],
 )
 
 tf_kernel_library(
@@ -1674,9 +1673,9 @@ tf_cc_test(
         "@com_google_absl//absl/strings",
         "@com_google_googletest//:gtest_main",
         "@local_tsl//tsl/platform:blocking_counter",
-        "@local_tsl//tsl/platform:errors",
         "@local_tsl//tsl/platform:refcount",
-        "@local_tsl//tsl/platform:status",
+        "@local_xla//xla/tsl/platform:errors",
+        "@local_xla//xla/tsl/platform:status",
     ],
 )
 
@@ -2401,6 +2400,7 @@ tf_kernel_library(
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core:protos_all_cc",
+        "@com_google_absl//absl/log",
         "@eigen_archive//:eigen3",
     ],
     alwayslink = 1,
@@ -3001,7 +3001,7 @@ tf_kernel_library(
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "@eigen_archive//:eigen3",
-        "@local_xla//xla/stream_executor",
+        "@local_xla//xla/stream_executor:stream",
     ],
 )
 
@@ -3104,7 +3104,6 @@ tf_kernel_library(
         "//tensorflow/core/grappler/utils:functions",
         "//tensorflow/core/profiler/lib:traceme",
         "@com_google_absl//absl/strings",
-        "@local_xla//xla/stream_executor",
     ],
 )
 
@@ -3603,7 +3602,6 @@ tf_kernel_library(
         ":gpu_utils",
         ":conv_ops",
         ":matmul_util",
-        "@local_xla//xla/stream_executor/gpu:gpu_asm_opts",
         "@local_xla//xla/stream_executor/gpu:redzone_allocator",
         "@local_xla//xla/stream_executor/integrations:tf_allocator_adapter",
         "//tensorflow/core/profiler/lib:scoped_annotation",
@@ -3914,9 +3912,6 @@ tf_cuda_cc_test(
 tf_cuda_cc_test(
     name = "matmul_op_test",
     srcs = ["matmul_op_test.cc"],
-    tags = [
-        "no_aarch64",  # b/282068262
-    ],
     deps = [
         ":matmul_op",
         ":ops_testutil",
@@ -3936,7 +3931,7 @@ tf_cuda_cc_test(
         "//tensorflow/core:testlib",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/strings",
-        "@local_tsl//tsl/platform:status",
+        "@local_xla//xla/tsl/platform:status",
     ],
 )
 
@@ -4167,9 +4162,7 @@ tf_kernel_library(
         ":numeric_options_utils",
         "@local_xla//xla/stream_executor/cuda:cublas_plugin",
         "@local_xla//xla/stream_executor/cuda:cudnn_plugin",
-        "@local_xla//xla/stream_executor/gpu:gpu_asm_opts",
         "@local_xla//xla/stream_executor/integrations:tf_allocator_adapter",
-        "@local_xla//xla/stream_executor",
         "//tensorflow/core/platform:stream_executor",
     ]) + if_cuda_or_rocm([
         ":gpu_utils",
@@ -4767,6 +4760,8 @@ tf_kernel_library(
     prefix = "decode_compressed_op",
     deps = [
         "//tensorflow/core:lib_internal",
+        "@com_google_absl//absl/status",
+        "@net_zstd//:zstdlib",
     ] + PARSING_DEPS,
 )
 
@@ -7183,6 +7178,7 @@ cc_library(
         "//tensorflow/core/framework:tensor_shape_proto_cc",
         "//tensorflow/core/framework:types_proto_cc",
         "//tensorflow/core/lib/png:png_io",
+        "//tensorflow/core/lib/webp:webp_io",
         "//tensorflow/core/platform:strong_hash",
         "//tensorflow/core/platform:types",
         "//tensorflow/core/protobuf:autotuning_proto_cc",
@@ -8048,7 +8044,6 @@ tf_cc_shared_library(
         "@com_googlesource_code_re2//:__subpackages__",
         "@compute_library//:__subpackages__",
         "@curl//:__subpackages__",
-        "@double_conversion//:__subpackages__",
         "@eigen_archive//:__subpackages__",
         "@farmhash_archive//:__subpackages__",
         "@farmhash_gpu_archive//:__subpackages__",
@@ -8071,7 +8066,7 @@ tf_cc_shared_library(
         "@local_config_tensorrt//:__subpackages__",
         "@local_execution_config_platform//:__subpackages__",
         "@mkl_dnn_acl_compatible//:__subpackages__",
-        "@nsync//:__subpackages__",
+        "@net_zstd//:__subpackages__",
         "@onednn//:__subpackages__",
         "@org_sqlite//:__subpackages__",
         "@platforms//:__subpackages__",

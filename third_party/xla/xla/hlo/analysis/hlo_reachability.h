@@ -22,6 +22,8 @@ limitations under the License.
 
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/functional/function_ref.h"
+#include "absl/log/check.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -53,12 +55,13 @@ class HloReachabilityMap {
   // dependencies (operands) and control dependencies are considered for
   // reachability. Trivially an instruction is reachable from itself.
   static std::unique_ptr<HloReachabilityMap> Build(
-      const HloComputation* computation);
+      const HloComputation* computation,
+      const std::vector<HloInstruction*>& po_instructions = {});
 
   // Similar to the above Build operation except that it tries to identify
   // paths between instructions that do not contain control instructions
   // and multiple operands, i.e., b is_reachable a == true iff
-  // b = f(f(f(f(f(a), constant), constant), constant).
+  // b = f(f(f(f(f(a), constant), constant), constant), constant).
   // Further, the only ops allowed in a path are basic math operations such
   // as add, sub, mul, div.
   static std::unique_ptr<HloReachabilityMap> BuildWithRestrictions(

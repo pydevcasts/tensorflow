@@ -33,7 +33,7 @@ limitations under the License.
 #include "xla/python/ifrt/serdes.h"
 #include "xla/python/ifrt/sharding.pb.h"
 #include "xla/tsl/concurrency/ref_count.h"
-#include "tsl/platform/statusor.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace ifrt {
@@ -48,7 +48,8 @@ class CustomCallProgramSerDes
     return "xla::ifrt::CustomCallProgram";
   }
 
-  absl::StatusOr<std::string> Serialize(Serializable& serializable) override {
+  absl::StatusOr<std::string> Serialize(
+      Serializable& serializable, std::unique_ptr<SerializeOptions>) override {
     const CustomCallProgram& program =
         llvm::cast<CustomCallProgram>(serializable);
     CustomCallProgramProto proto;
@@ -80,25 +81,23 @@ class CustomCallProgramSerDes
           "Failed to parse serialized CustomCallProgramProto");
     }
     TF_ASSIGN_OR_RETURN(
-        tsl::RCReference<DeviceList> devices,
-        DeviceList::FromProto(deserialize_program_options->lookup_device,
+        DeviceListRef devices,
+        DeviceList::FromProto(deserialize_program_options->client,
                               proto.devices()));
     std::vector<ArraySpec> input_specs;
     input_specs.reserve(proto.input_specs_size());
     for (const ArraySpecProto& spec_proto : proto.input_specs()) {
-      TF_ASSIGN_OR_RETURN(
-          ArraySpec spec,
-          ArraySpec::FromProto(deserialize_program_options->lookup_device,
-                               spec_proto));
+      TF_ASSIGN_OR_RETURN(ArraySpec spec,
+                          ArraySpec::FromProto(
+                              deserialize_program_options->client, spec_proto));
       input_specs.push_back(std::move(spec));
     }
     std::vector<ArraySpec> output_specs;
     output_specs.reserve(proto.output_specs_size());
     for (const ArraySpecProto& spec_proto : proto.output_specs()) {
-      TF_ASSIGN_OR_RETURN(
-          ArraySpec spec,
-          ArraySpec::FromProto(deserialize_program_options->lookup_device,
-                               spec_proto));
+      TF_ASSIGN_OR_RETURN(ArraySpec spec,
+                          ArraySpec::FromProto(
+                              deserialize_program_options->client, spec_proto));
       output_specs.push_back(std::move(spec));
     }
 
@@ -124,7 +123,8 @@ class CustomCallCompileOptionsSerDes
     return "xla::ifrt::CustomCallCompileOptions";
   }
 
-  absl::StatusOr<std::string> Serialize(Serializable& serializable) override {
+  absl::StatusOr<std::string> Serialize(
+      Serializable& serializable, std::unique_ptr<SerializeOptions>) override {
     return "";
   }
 

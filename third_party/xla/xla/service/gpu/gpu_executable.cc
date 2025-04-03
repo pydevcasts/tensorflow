@@ -27,6 +27,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
@@ -37,6 +38,13 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "xla/backends/gpu/collectives/gpu_clique.h"
+#include "xla/backends/gpu/collectives/gpu_clique_key.h"
+#include "xla/backends/gpu/collectives/gpu_cliques.h"
+#include "xla/backends/gpu/runtime/annotation.h"
+#include "xla/backends/gpu/runtime/sequential_thunk.h"
+#include "xla/backends/gpu/runtime/thunk.h"
+#include "xla/core/collectives/rank_id.h"
 #include "xla/executable_run_options.h"
 #include "xla/hlo/ir/hlo_input_output_alias_config.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -48,14 +56,8 @@ limitations under the License.
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/gpu_executable_run_options.h"
-#include "xla/service/gpu/runtime/annotation.h"
-#include "xla/service/gpu/runtime/for_all_thunks.h"
-#include "xla/service/gpu/runtime/nccl_clique.h"
-#include "xla/service/gpu/runtime/nccl_clique_key.h"
-#include "xla/service/gpu/runtime/sequential_thunk.h"
-#include "xla/service/gpu/runtime/thunk.h"
+#include "xla/service/gpu/resource_requests.h"
 #include "xla/service/gpu/stream_executor_util.h"
-#include "xla/service/hlo_execution_profile.h"
 #include "xla/service/hlo_value.h"
 #include "xla/service/maybe_owning_device_memory.h"
 #include "xla/service/rendezvous.h"
@@ -80,6 +82,7 @@ limitations under the License.
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
 #include "xla/util.h"
 #include "tsl/platform/env.h"
+#include "tsl/platform/env_time.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/logging.h"
 #include "tsl/platform/random.h"
@@ -99,13 +102,11 @@ using ::tsl::profiler::ScopedAnnotation;
 static absl::flat_hash_set<ExecutionStreamId> GetExecutionStreamIds(
     const SequentialThunk& thunks) {
   absl::flat_hash_set<ExecutionStreamId> stream_ids;
-  ForAllThunks(
-      [&](const Thunk* thunk) {
-        if (thunk->execution_stream_id() > 0) {
-          stream_ids.insert(thunk->execution_stream_id());
-        }
-      },
-      &thunks);
+  thunks.ForAllThunks([&](const Thunk* thunk) {
+    if (thunk->execution_stream_id() > 0) {
+      stream_ids.insert(thunk->execution_stream_id());
+    }
+  });
   return stream_ids;
 }
 
@@ -133,13 +134,14 @@ GpuExecutable::GpuExecutable(GpuExecutable::Params params)
       constants_(std::move(params.constants)),
       output_info_(std::move(params.output_info)),
       enable_debug_info_manager_(params.enable_debug_info_manager) {
-#if TENSORFLOW_USE_ROCM
-  // ROCm uses hsaco hashes to distinguish between modules.
-  // Bad things happen if multiple modules with identical code are loaded.
-  binary_.resize(binary_.size() + 16);
-  *(uint64_t*)(&binary_[binary_.size() - 16]) = tsl::EnvTime::NowNanos();
-  *(uint64_t*)(&binary_[binary_.size() - 8]) = tsl::random::New64();
-#endif
+  if (std::holds_alternative<stream_executor::RocmComputeCapability>(
+          gpu_version_)) {
+    // ROCm uses hsaco hashes to distinguish between modules.
+    // Bad things happen if multiple modules with identical code are loaded.
+    binary_.resize(binary_.size() + 16);
+    *(uint64_t*)(&binary_[binary_.size() - 16]) = tsl::EnvTime::NowNanos();
+    *(uint64_t*)(&binary_[binary_.size() - 8]) = tsl::random::New64();
+  }
   if (has_module() && enable_debug_info_manager_) {
     XlaDebugInfoManager::Get()->RegisterModule(shared_module(),
                                                buffer_assignment_->ToProto());
@@ -185,151 +187,6 @@ absl::Status GpuExecutable::CheckCompatibilityWithServiceExecutableRunOptions(
 
 namespace {
 
-// Shared resources required for thunk initialization and execution.
-class ResourceRequests : public Thunk::ResourceRequests {
- public:
-  absl::Status AddClique(const NcclCliqueKey& clique_key,
-                         int32_t num_local_participants) final {
-    VLOG(5) << "Add collective clique request: " << clique_key.ToString()
-            << "; num_local_participants: " << num_local_participants;
-
-    // Check if there is already a clique request for this clique key.
-    if (auto it = cliques_.find(clique_key); it != cliques_.end()) {
-      // We can't have multiple requests for a same clique key with different
-      // number of local participants as we can acquire a clique only once and
-      // we have to know how many executables will join the rendezvous.
-      if (it->second.num_local_participants != num_local_participants) {
-        return absl::InternalError(absl::StrFormat(
-            "Clique request for a clique key %s has number of local "
-            "participants %d different from previously requested value of %d. "
-            "This will lead to deadlock at run time and is an XLA compiler "
-            "bug. Please report it to XLA team.",
-            clique_key.ToString(), num_local_participants,
-            it->second.num_local_participants));
-      }
-      return absl::OkStatus();
-    }
-
-    // XLA compiler guarantees that all collective operations have the same
-    // order on all replicas. We rely on this property to assign unique id to
-    // clique requests simply based on the number of already recored requests.
-    int64_t id = cliques_.size();
-    cliques_.try_emplace(clique_key,
-                         CliqueRequest{clique_key, num_local_participants, id});
-    return absl::OkStatus();
-  }
-
-  absl::StatusOr<Thunk::CollectiveCliques> AcquireCollectiveCliques(
-      const Thunk::CollectiveExecuteParams& params) {
-    if (cliques_.empty()) return Thunk::CollectiveCliques();
-
-    VLOG(2) << "Acquire " << cliques_.size()
-            << " collective cliques for global device id "
-            << params.global_device_id.value()
-            << "; run_id=" << params.run_id.ToInt()
-            << "; max number of channels for collectives "
-            << params.collective_max_nchannels
-            << "; max number of channels for p2p " << params.p2p_max_nchannels;
-
-    std::vector<CliqueRequest> ordered_cliques = GetOrderedCliqueRequests();
-    for (size_t i = 0; i < ordered_cliques.size(); ++i) {
-      const CliqueRequest& r = ordered_cliques[i];
-      VLOG(2) << "  clique #" << i << " (for global device id "
-              << params.global_device_id.value() << ")"
-              << ": num_local_participants=" << r.num_local_participants
-              << "; id=" << r.id << "; key=" << r.key.ToString();
-    }
-
-    tsl::profiler::TraceMe trace([&] {
-      return tsl::profiler::TraceMeEncode("AcquireCollectiveCliques",
-                                          {{"num_cliques", cliques_.size()}});
-    });
-
-    auto start_micros = tsl::Env::Default()->NowMicros();
-
-    NcclClique::AcquiredCliquesMap cliques_map;
-
-    for (const CliqueRequest& r : ordered_cliques) {
-      std::optional<int64_t> rank = r.key.rank(params.global_device_id);
-
-      if (!rank.has_value()) {
-        return absl::InternalError(absl::StrCat(
-            "Can't find global device id ", params.global_device_id.value(),
-            " in clique key ", r.key.ToString()));
-      }
-
-      bool is_local = r.key.devices().size() == r.num_local_participants;
-      TF_ASSIGN_OR_RETURN(
-          const NcclCliqueIdCallback* clique_id_callback,
-          GetNcclCliqueIdCallback(params.nccl_clique_id_callback, is_local));
-
-      int64_t max_channels = r.key.stream_kind() == AsyncStreamKind::kCollective
-                                 ? params.collective_max_nchannels
-                                 : params.p2p_max_nchannels;
-      TF_ASSIGN_OR_RETURN(std::shared_ptr<NcclClique::Lock> clique,
-                          AcquireNcclClique(params.executor, params.run_id,
-                                            r.key, *clique_id_callback, *rank,
-                                            r.num_local_participants,
-                                            cliques_map, max_channels));
-
-      cliques_map[r.key] = std::move(clique);
-    }
-
-    auto end_micros = tsl::Env::Default()->NowMicros();
-    VLOG(2) << "Acquired " << cliques_map.size()
-            << " collective cliques for global device id "
-            << params.global_device_id.value() << " in "
-            << (end_micros - start_micros) << " μs"
-            << "; run_id=" << params.run_id.ToInt();
-
-    return Thunk::CollectiveCliques(std::move(cliques_map));
-  }
-
- private:
-  struct CliqueRequest {
-    NcclCliqueKey key;
-    int64_t num_local_participants;
-    int64_t id;
-  };
-
-  // Return clique requests deterministically ordered using a comparison
-  // function that produces identical ordering for all participating ranks.
-  //
-  // Example: 8 ranks splitted in different groups of communicators
-  //
-  // Group #0: [0,1], [2,3], [4,5], [6,7]
-  // Group #1: [0,4], [1,5], [2,6], [3,7]
-  //
-  // Both groups #0 and #1 can be acqured by splitting [0...7] clique. To avoid
-  // deadlocks all participants should acquire all cliques in a group #0 before
-  // acquiring any cliques in a group #1.
-  //
-  // We rely on clique request id to guarantee that the order is identical
-  // on all participating ranks (including ranks running on different hosts).
-  std::vector<CliqueRequest> GetOrderedCliqueRequests() {
-    std::vector<CliqueRequest> cliques;
-    cliques.reserve(cliques_.size());
-    for (const auto& [_, request] : cliques_) cliques.push_back(request);
-
-    absl::c_sort(cliques, [](const CliqueRequest& a, const CliqueRequest& b) {
-      // Acquire larger cliques first to be able to split them later.
-      if (a.key.devices().size() > b.key.devices().size()) return true;
-      if (b.key.devices().size() > a.key.devices().size()) return false;
-
-      // If cliques have the same size prefer cliques with smaller stream id.
-      if (a.key.stream_id().value() < b.key.stream_id().value()) return true;
-      if (b.key.stream_id().value() < a.key.stream_id().value()) return false;
-
-      // Prefer cliques with smaller id (comes earlier in execution order).
-      return a.id < b.id;
-    });
-
-    return cliques;
-  }
-
-  absl::flat_hash_map<NcclCliqueKey, CliqueRequest> cliques_;
-};
-
 absl::Status MaybeSyncAndProfile(const ServiceExecutableRunOptions* run_options,
                                  se::EventBasedTimer* execution_timer,
                                  se::Stream* stream_to_sync);
@@ -338,7 +195,7 @@ absl::Status RendezvousAfterInitialization(
     const ServiceExecutableRunOptions* run_options,
     const DebugOptions* debug_options);
 
-absl::Status ExecuteThunks(
+absl::Status ExecuteThunksImpl(
     const DebugOptions* debug_options, const std::string& module_name,
     ModuleIdentifier module_id, SequentialThunk& thunk_sequence,
     Thunk::ExecutableSource executable_source,
@@ -349,7 +206,7 @@ absl::Status ExecuteThunks(
       run_options->run_options().gpu_executable_run_options()
           ? run_options->run_options()
                 .gpu_executable_run_options()
-                ->enable_mock_nccl_collectives()
+                ->enable_mock_collectives()
           : false;
 
   int64_t collective_max_nchannels =
@@ -362,6 +219,13 @@ absl::Status ExecuteThunks(
           ? debug_options->xla_gpu_enable_highest_priority_async_stream()
           : false;
 
+  bool requires_exclusive_lock_on_gpu =
+      run_options->run_options().gpu_executable_run_options()
+          ? run_options->run_options()
+                .gpu_executable_run_options()
+                ->requires_exclusive_lock_on_gpu()
+          : false;
+
   se::Stream* main_stream = run_options->stream();
   se::StreamExecutor* executor = main_stream->parent();
   stream_executor::StreamPriority stream_priority =
@@ -370,7 +234,7 @@ absl::Status ExecuteThunks(
     stream_priority = stream_executor::StreamPriority::Highest;
   }
 
-  // Borrow streams required for NcclCollectiveThunk.
+  // Borrow streams required for CollectiveThunk.
   absl::InlinedVector<se::Stream*, kAsyncStreamTotal> async_comms_streams(
       kAsyncStreamTotal, nullptr);
   se::Stream* command_buffer_trace_stream = nullptr;
@@ -441,7 +305,11 @@ absl::Status ExecuteThunks(
   if (!mock_collectives) {
     TF_ASSIGN_OR_RETURN(
         collective_cliques,
-        resource_requests.AcquireCollectiveCliques(collective_params));
+        resource_requests.AcquireCollectiveCliques(
+            collective_params,
+            debug_options
+                ? debug_options->xla_gpu_collectives_use_persistent_cliques()
+                : false));
   }
 
   {  // Initialize thunks using prepared resources before execution.
@@ -454,16 +322,19 @@ absl::Status ExecuteThunks(
         &collective_params,
         &collective_cliques,
         run_options->run_options().ffi_execution_context(),
-        run_options->local_device_count()};
+        run_options->local_device_count(),
+        requires_exclusive_lock_on_gpu};
 
     tsl::profiler::TraceMe trace([&] { return "Thunks::Initialize"; });
     TF_RETURN_IF_ERROR(thunk_sequence.Initialize(initialize_params));
   }
 
   // Maybe join a round of rendezvous after thunk initialization. We do this
-  // only in presence of collective cliques which means that we have collective
-  // operations in the XLA operations that tend to cause deadlocks.
-  if (!collective_cliques.empty()) {
+  // only in presence of newly acquired collective cliques which means that we
+  // have collective operations and clique initialization is famous for
+  // introducing deadlocks if we try to execute it concurrently with other
+  // potentially memory-allocating operations.
+  if (collective_cliques.num_transient_cliques() > 0) {
     TF_RETURN_IF_ERROR(
         RendezvousAfterInitialization(run_options, debug_options));
   }
@@ -474,7 +345,11 @@ absl::Status ExecuteThunks(
       command_buffer_trace_stream, &collective_params, &collective_cliques,
       std::move(additional_execution_streams));
 
+  VLOG(1) << "[" << run_options->device_ordinal() << "] "
+          << "Start GpuExecutable::ExecuteOnStream module: " << module_name;
   TF_RETURN_IF_ERROR(thunk_sequence.ExecuteOnStream(execute_params));
+  VLOG(1) << "[" << run_options->device_ordinal() << "] "
+          << "End GpuExecutable::ExecuteOnStream module: " << module_name;
 
   return MaybeSyncAndProfile(run_options, execution_timer.get(),
                              block_host_until_done ? main_stream : nullptr);
@@ -551,7 +426,7 @@ absl::Status RendezvousAfterInitialization(
       run_options->device_ordinal(),
       run_options->run_options().run_id().ToInt());
 
-  RendezvousSingle(
+  Rendezvous(
       rendezvous_name, rendezvous_key, num_local_participants,
       absl::Seconds(
           debug_options
@@ -782,15 +657,13 @@ absl::StatusOr<BufferAllocations> GpuExecutable::GenerateBufferAllocations(
 
 absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStream(
     const ServiceExecutableRunOptions* run_options,
-    std::vector<ExecutionInput> arguments,
-    HloExecutionProfile* hlo_execution_profile) {
+    std::vector<ExecutionInput> arguments) {
   return ExecuteAsyncOnStreamImpl(run_options, absl::MakeSpan(arguments));
 }
 
 absl::StatusOr<ScopedShapedBuffer> GpuExecutable::ExecuteAsyncOnStream(
     const ServiceExecutableRunOptions* run_options,
-    absl::Span<const ShapedBuffer* const> arguments,
-    HloExecutionProfile* hlo_execution_profile) {
+    absl::Span<const ShapedBuffer* const> arguments) {
   TF_ASSIGN_OR_RETURN(ExecutionOutput out,
                       ExecuteAsyncOnStreamImpl(run_options, arguments));
   return out.ConsumeResult();
@@ -807,10 +680,6 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
   // GpuExecutable always bound to a single GpuContext during its execution, so
   // we activate it once to skip expensive context activations later.
   auto activation = executor->Activate();
-
-  // Force synchronous execution if the allocator requires it.
-  const bool block_host_until_done =
-      !memory_allocator->AllowsAsynchronousDeallocation();
 
   // Lock the GPU with a shared lock so that we don't interfere with autotuning
   // that may be running during JIT compilation while allowing multiple XLA
@@ -849,32 +718,6 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
                                 device_ordinal));
   VLOG(3) << buffer_allocations.ToString();
   absl::Span<const BufferAllocation> allocations = GetAllocations();
-
-  if (VLOG_IS_ON(5)) {
-    // Debug code to compare current allocation's address with previous run's
-    // address, and report the allocation info if memory addressed changed.
-    // Useful for identify in user's model if it is command buffer perf friendly
-    // (no command buffer update cost).
-    absl::MutexLock lock(&module_handle_mutex_);
-    if (module_allocations_.find(executor) == module_allocations_.end()) {
-      std::vector<se::DeviceMemoryBase> allocs_addr;
-      allocs_addr.reserve(buffer_allocations.size());
-      for (int i = 0; i < buffer_allocations.size(); i++) {
-        allocs_addr.push_back(buffer_allocations.GetDeviceAddress(i));
-      }
-      module_allocations_[executor] = std::move(allocs_addr);
-    } else {
-      for (int i = 0; i < buffer_allocations.size(); i++) {
-        if (module_allocations_[executor][i].IsSameAs(
-                buffer_allocations.GetDeviceAddress(i))) {
-          continue;
-        }
-        module_allocations_[executor][i] =
-            buffer_allocations.GetDeviceAddress(i);
-        VLOG(5) << "Gpu address changed for module " << module_name_;
-      }
-    }
-  }
 
   std::set<se::DeviceMemoryBase> buffers_in_result;
 
@@ -959,10 +802,7 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
                                        /*retry_on_failure=*/true,
                                        /*memory_space=*/allocation->color());
         if (!allocated_buffer.ok()) {
-          return ResourceExhausted("%s\n%s\n",
-                                   allocated_buffer.status().message(),
-                                   buffer_assignment_->ToVerboseString(
-                                       debug_buffer_assignment_show_max_));
+          return VerboseAllocationError(allocated_buffer.status());
         }
         result_buffer = allocated_buffer->Release();
         se::DeviceMemoryBase& aliased_buffer =
@@ -990,22 +830,7 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
     buffers_in_result.insert(result_buffer);
   }
 
-  {
-    TF_RETURN_IF_ERROR(
-        CheckCompatibilityWithServiceExecutableRunOptions(run_options));
-
-    ScopedAnnotation annotation([&] { return module_annotations_.top_level; });
-    ScopedModuleAnnotations module_annotations(&module_annotations_);
-
-    ModuleIdentifier unique_id = has_module() ? module().unique_id() : -1;
-    Thunk::ExecutableSource executable_source = {text_, binary_,
-                                                 dnn_compiled_graphs_};
-
-    TF_RETURN_IF_ERROR(ExecuteThunks(
-        has_module() ? &module_config().debug_options() : nullptr, module_name_,
-        unique_id, *thunks_, executable_source, run_options, buffer_allocations,
-        block_host_until_done, execution_stream_ids_));
-  }
+  TF_RETURN_IF_ERROR(ExecuteThunks(buffer_allocations, run_options));
 
   TF_RETURN_IF_ERROR(
       buffer_allocations.TearDown(buffers_in_result, GetAllocations()));
@@ -1015,6 +840,64 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
     MarkToBeReleasedArguments(*args, result);
   }
   return std::move(result);
+}
+
+absl::Status GpuExecutable::VerboseAllocationError(absl::Status s) {
+  return ResourceExhausted(
+      "%s\n%s\n", s.message(),
+      buffer_assignment_->ToVerboseString(debug_buffer_assignment_show_max_));
+}
+
+absl::Status GpuExecutable::ExecuteThunks(
+    const BufferAllocations& buffer_allocations,
+    const ServiceExecutableRunOptions* run_options) {
+  if (VLOG_IS_ON(5)) {
+    se::StreamExecutor* executor = run_options->stream()->parent();
+    // Debug code to compare current allocation's address with previous run's
+    // address, and report the allocation info if memory addressed changed.
+    // Useful for identify in user's model if it is command buffer perf friendly
+    // (no command buffer update cost).
+    absl::MutexLock lock(&module_handle_mutex_);
+    if (module_allocations_.find(executor) == module_allocations_.end()) {
+      std::vector<se::DeviceMemoryBase> allocs_addr;
+      allocs_addr.reserve(buffer_allocations.size());
+      for (int i = 0; i < buffer_allocations.size(); i++) {
+        allocs_addr.push_back(buffer_allocations.GetDeviceAddress(i));
+      }
+      module_allocations_[executor] = std::move(allocs_addr);
+    } else {
+      for (int i = 0; i < buffer_allocations.size(); i++) {
+        if (module_allocations_[executor][i].IsSameAs(
+                buffer_allocations.GetDeviceAddress(i))) {
+          continue;
+        }
+        module_allocations_[executor][i] =
+            buffer_allocations.GetDeviceAddress(i);
+        VLOG(5) << "Gpu address changed for module " << module_name_;
+      }
+    }
+  }
+
+  se::DeviceMemoryAllocator* const memory_allocator = run_options->allocator();
+  // Force synchronous execution if the allocator requires it.
+  const bool block_host_until_done =
+      !memory_allocator->AllowsAsynchronousDeallocation();
+
+  TF_RETURN_IF_ERROR(
+      CheckCompatibilityWithServiceExecutableRunOptions(run_options));
+
+  ScopedAnnotation annotation([&] { return module_annotations_.top_level; });
+  ScopedModuleAnnotations module_annotations(&module_annotations_);
+
+  ModuleIdentifier unique_id = has_module() ? module().unique_id() : -1;
+  Thunk::ExecutableSource executable_source = {text_, binary_,
+                                               dnn_compiled_graphs_};
+
+  TF_RETURN_IF_ERROR(ExecuteThunksImpl(
+      has_module() ? &module_config().debug_options() : nullptr, module_name_,
+      unique_id, *thunks_, executable_source, run_options, buffer_allocations,
+      block_host_until_done, execution_stream_ids_));
+  return absl::OkStatus();
 }
 
 int64_t GpuExecutable::SizeOfGeneratedCodeInBytes() const {

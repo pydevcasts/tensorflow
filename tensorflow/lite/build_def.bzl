@@ -215,6 +215,7 @@ def tflite_jni_binary(
         linkopts = tflite_jni_linkopts(),
         linkscript = LINKER_SCRIPT,
         exported_symbols = EXPORTED_SYMBOLS,
+        stamp = -1,
         linkshared = 1,
         linkstatic = 1,
         testonly = 0,
@@ -244,6 +245,7 @@ def tflite_jni_binary(
         copts = copts,
         linkshared = linkshared,
         linkstatic = linkstatic,
+        stamp = stamp,
         deps = deps + [linkscript, exported_symbols],
         srcs = srcs,
         tags = tags,
@@ -389,6 +391,7 @@ def _gen_selected_ops_impl(ctx):
         executable = ctx.executable._generate_op_registrations,
         mnemonic = "OpRegistration",
         progress_message = "gen_selected_ops",
+        use_default_shell_env = True,
     )
 
 gen_selected_ops_rule = rule(
@@ -871,7 +874,7 @@ def _label(target):
     Args:
       target: (string) a relative or absolute build target.
     """
-    if target[0:2] == "//":
+    if target[0:2] == "//" or "@org_tensorflow//" in target:
         return Label(target)
     if target[0] == ":":
         return Label("//" + native.package_name() + target)
@@ -937,3 +940,8 @@ register_extension_info(
     extension = tflite_cc_library_with_c_headers_test,
     label_regex_for_dep = "{extension_name}",
 )
+
+# Workaround bug in Bazel before 8.0 where --cxxopt didn't apply to objc++ compilations.
+CXX17_BAZEL_ONLY_COPTS = [
+    "-std=c++17",  # copybara:comment
+]

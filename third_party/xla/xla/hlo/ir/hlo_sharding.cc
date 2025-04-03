@@ -44,11 +44,11 @@ limitations under the License.
 #include "xla/shape_tree.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/errors.h"
 #include "tsl/platform/protobuf.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
@@ -128,7 +128,7 @@ HloSharding HloSharding::AssignDevice(int64_t device_id,
 
 HloSharding HloSharding::Tile1D(const Shape& input_shape, int64_t num_tiles,
                                 absl::Span<const OpMetadata> metadata) {
-  CHECK_EQ(1, input_shape.rank());
+  CHECK_EQ(1, input_shape.dimensions_size());
   CHECK_GT(num_tiles, 1);
   absl::Span<const int64_t> dimensions(&num_tiles, 1);
   return HloSharding(TileAssignment(dimensions, dimensions, {0}),
@@ -776,7 +776,7 @@ absl::Status HloSharding::ValidateNonTuple(
   }
 
   // The tile assignment tensor must have the same rank as the tiled data rank.
-  if (shape.rank() != TiledDataRank()) {
+  if (shape.dimensions_size() != TiledDataRank()) {
     return tsl::errors::InvalidArgument(
         "Number of tile assignment dimensions (excluding subgroups) is "
         "different than the input rank. "
